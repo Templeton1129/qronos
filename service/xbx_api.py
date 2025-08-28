@@ -134,7 +134,7 @@ def _download_file_zip(download_url, temp_path, target_path, max_retries=5):
             if not temp_path.exists():
                 logger.info(f"开始下载文件: {download_url}")
                 # 使用流式下载，避免大文件导致内存溢出
-                with requests.get(download_url, stream=True, timeout=60) as r:
+                with requests.get(download_url, stream=True, timeout=60 * 5) as r:
                     r.raise_for_status()
                     with open(temp_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=8192):
@@ -319,7 +319,7 @@ class XbxAPI:
             logger.warning("登录失败：缺少UUID或API密钥")
             return False
 
-        resp = requests.post(api_qtcls_user_login_token_url, data={"uuid": self.uuid, "api_key": self.apikey})
+        resp = requests.post(api_qtcls_user_login_token_url, data={"uuid": self.uuid, "api_key": self.apikey}, timeout=10)
 
         if resp.status_code == 200 and resp.json().get("data"):
             token = resp.json()["data"]
@@ -398,9 +398,9 @@ class XbxAPI:
                     params["token"] = self.token
                     logger.info("Token刷新成功，重新发送请求")
                     if method.upper() == 'GET':
-                        return requests.get(url, params=params)
+                        return requests.get(url, params=params, timeout=10)
                     elif method.upper() == 'POST':
-                        return requests.post(url, data=params)
+                        return requests.post(url, data=params, timeout=10)
                 else:
                     logger.error("Token刷新失败")
             except TokenExpiredException:
@@ -448,7 +448,7 @@ class XbxAPI:
         """
         self._ensure_token()
         params = {"token": self.token}
-        resp = requests.get(api_qtcls_data_client_basic_code_url, params=params)
+        resp = requests.get(api_qtcls_data_client_basic_code_url, params=params, timeout=10)
 
         # 尝试刷新token
         refreshed_resp = self._handle_token_refresh(resp, params, api_qtcls_data_client_basic_code_url)
@@ -661,7 +661,7 @@ class XbxAPI:
         logger.info(f"开始下载市值数据到: {coin_cap_path}")
         self._ensure_token()
         params = {"token": self.token}
-        resp = requests.get(api_qtcls_data_coin_cap_hist_url, params=params)
+        resp = requests.get(api_qtcls_data_coin_cap_hist_url, params=params, timeout=10)
 
         # 修复：使用正确的URL进行token刷新
         refreshed_resp = self._handle_token_refresh(resp, params, api_qtcls_data_coin_cap_hist_url)
@@ -779,7 +779,7 @@ class XbxAPI:
         ticket_url = api_qtcls_basic_code_download_ticket_url % code_id
 
         logger.info(f"获取下载ticket: {code_id}")
-        ticket_resp = requests.get(ticket_url, params=ticket_params)
+        ticket_resp = requests.get(ticket_url, params=ticket_params, timeout=10)
         refreshed_resp = self._handle_token_refresh(ticket_resp, ticket_params, ticket_url)
         if refreshed_resp:
             ticket_resp = refreshed_resp
@@ -840,7 +840,7 @@ class XbxAPI:
         logger.info(f"使用ticket获取下载链接，最多重试60次")
         for attempt in range(60):
             try:
-                link_resp = requests.get(link_url, params=link_params)
+                link_resp = requests.get(link_url, params=link_params, timeout=10)
                 refreshed_resp = self._handle_token_refresh(link_resp, link_params, link_url)
                 if refreshed_resp:
                     link_resp = refreshed_resp

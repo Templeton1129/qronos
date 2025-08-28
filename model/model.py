@@ -117,3 +117,14 @@ class FrameworkCfgModel(BaseModel):
     realtime_data_path: Optional[str] = ''
     is_debug: bool = False
     error_webhook_url: str = ''
+    factor_col_limit: int = 32
+
+
+class DeviceInfo(BaseModel):
+    id: str
+    device_type: str
+    browser_info: str
+    ip_address: str
+    last_active_time: str
+    created_time: str
+    is_current: bool = False

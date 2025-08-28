@@ -29,3 +29,10 @@ class UploadFolderEnum(str, Enum):
 class AccountTypeEnum(str, Enum):
     PORTFOLIO_MARGIN = '统一账户'
     STANDARD = '普通账户'
+
+
+class DeviceTypeEnum(str, Enum):
+    """设备类型枚举"""
+    PC = 'pc'
+    MOBILE = 'mobile'
+    TABLET = 'tablet'

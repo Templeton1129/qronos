@@ -2,12 +2,19 @@ import ast
 import json
 import shutil
 import traceback
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import Tuple, Dict, Optional
 
 import pandas as pd
 
+from utils.constant import TMP_PATH
 from utils.log_kit import get_logger
+from utils.zip_utils import (
+    create_zip_archive, extract_zip_archive, create_temp_directory, cleanup_temp_directory, calculate_directory_size,
+    cleanup_zip_files_by_count, copy_directory_with_filter
+)
 
 logger = get_logger()
 
@@ -84,12 +91,13 @@ def process_framework_account_statistics(framework_status):
                     equity_start_time = df['time'].min()
                     
                     # 计算24小时数据
-                    last_24h_df = df[df['time'] > df['time'] - pd.Timedelta(hours=24)]
-                    if not last_24h_df.empty:
-                        account_info['eq_pct_24h'] = round(100 * (last_24h_df.iloc[-1]['账户总净值'] / last_24h_df.iloc[0]['账户总净值'] - 1), 2)
-                        account_info['eq_pnl_24h'] = round(last_24h_df.iloc[-1]['账户总净值'] - last_24h_df.iloc[0]['账户总净值'], 2)
-                        account_info['eq_max_24h'] = last_24h_df['账户总净值'].max()
-                        account_info['eq_min_24h'] = last_24h_df['账户总净值'].min()
+                    last_24h_df = df[df['time'] > df['time'].max() - pd.Timedelta(hours=24)]
+                    _filter_24h_df = last_24h_df.loc[last_24h_df['type'] == 'log']
+                    if not _filter_24h_df.empty:
+                        account_info['eq_pct_24h'] = round(100 * (_filter_24h_df.iloc[-1]['账户总净值'] / _filter_24h_df.iloc[0]['账户总净值'] - 1), 2)
+                        account_info['eq_pnl_24h'] = round(_filter_24h_df.iloc[-1]['账户总净值'] - _filter_24h_df.iloc[0]['账户总净值'], 2)
+                        account_info['eq_max_24h'] = _filter_24h_df['账户总净值'].max()
+                        account_info['eq_min_24h'] = _filter_24h_df['账户总净值'].min()
 
                     # 格式化资金曲线数据
                     df['time'] = df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -1048,3 +1056,402 @@ def _migrate_snapshot_data(raw_framework_path, target_framework_path, account_na
         logger.error(f"迁移snapshot数据失败 {account_name}: {e}")
     
     return migrated_snapshots
+
+
+def export_framework_data(framework_status, export_name: Optional[str] = None) -> Tuple[bool, Dict, str]:
+    """
+    导出框架数据到ZIP包
+    
+    Args:
+        framework_status: 框架状态对象
+        export_name: 导出包名称（可选）
+        
+    Returns:
+        tuple: (success: bool, result: dict, error_msg: str)
+    """
+    logger.info(f"开始导出框架数据: {framework_status.framework_name} ({framework_status.framework_id})")
+    
+    try:
+        # 获取框架路径
+        framework_path = Path(framework_status.path)
+        
+        if not framework_path.exists():
+            error_msg = f'框架路径不存在: {framework_path}'
+            logger.error(error_msg)
+            return False, {}, error_msg
+        
+        # 生成导出文件名
+        if not export_name:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_name = f"export_{framework_status.framework_id}_{timestamp}"
+        
+        # 创建临时目录
+        temp_dir = create_temp_directory("qronos_export_")
+        export_dir = temp_dir / "export_data"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            # 收集需要导出的数据
+            exported_accounts = []
+            exported_data_dirs = []
+            total_files = 0
+            
+            # 1. 导出accounts目录
+            accounts_source = framework_path / 'accounts'
+            if accounts_source.exists():
+                accounts_target = export_dir / 'accounts'
+                accounts_target.mkdir(parents=True, exist_ok=True)
+                
+                for file in accounts_source.iterdir():
+                    if file.is_file() and file.suffix in ['.json', '.py']:
+                        shutil.copy2(file, accounts_target / file.name)
+                        if file.suffix == '.json' and not file.name.startswith('_'):
+                            exported_accounts.append(file.stem)
+                        total_files += 1
+                        # logger.debug(f"已导出账户文件: {file.name}")
+            
+            # 2. 导出data目录（只导出账户名对应的目录）
+            data_source = framework_path / 'data'
+            if data_source.exists():
+                data_target = export_dir / 'data'
+                data_target.mkdir(parents=True, exist_ok=True)
+                
+                # 只导出有效账户对应的数据目录（仅包含"账户信息"子目录）
+                for account_name in exported_accounts:
+                    account_data_dir = data_source / account_name
+                    if account_data_dir.exists() and account_data_dir.is_dir():
+                        # 复制账户数据目录，只包含"账户信息"子目录
+                        target_item = data_target / account_name
+                        copied_files = copy_directory_with_filter(
+                            account_data_dir, 
+                            target_item,
+                            include_only_dirs=["账户信息"]
+                        )
+                        
+                        if copied_files > 0:
+                            exported_data_dirs.append(account_name)
+                            total_files += copied_files
+                            logger.debug(f"已导出账户数据目录: {account_name} (只包含: 账户信息, 文件数: {copied_files})")
+                        else:
+                            logger.warning(f"账户 {account_name} 没有账户信息目录，跳过导出")
+            
+            # 3. 导出config.json
+            config_source = framework_path / 'config.json'
+            if config_source.exists():
+                shutil.copy2(config_source, export_dir / 'config.json')
+                total_files += 1
+                logger.debug("已导出config.json")
+            
+            # 4. 导出框架核心目录 (factors, positions, sections, signals)
+            exported_framework_dirs = []
+            framework_dirs = ['factors', 'positions', 'sections', 'signals']
+            
+            for dir_name in framework_dirs:
+                source_dir = framework_path / dir_name
+                if source_dir.exists() and source_dir.is_dir():
+                    target_dir = export_dir / dir_name
+                    copied_files = copy_directory_with_filter(
+                        source_dir, 
+                        target_dir,
+                        exclude_dirs=["__pycache__"]
+                    )
+                    
+                    if copied_files > 0:
+                        exported_framework_dirs.append(dir_name)
+                        total_files += copied_files
+                        logger.debug(f"已导出框架目录: {dir_name} (排除: __pycache__, 文件数: {copied_files})")
+                    else:
+                        logger.warning(f"框架目录 {dir_name} 没有有效文件，跳过导出")
+                else:
+                    logger.debug(f"框架目录不存在，跳过: {dir_name}")
+            
+            # 5. 生成导出元数据
+            total_size = calculate_directory_size(export_dir)
+            metadata = {
+                "export_time": datetime.now().isoformat(),
+                "source_framework_id": framework_status.framework_id,
+                "source_framework_name": framework_status.framework_name,
+                "source_framework_path": str(framework_path),
+                "exported_accounts": exported_accounts,
+                "exported_data_dirs": exported_data_dirs,
+                "exported_framework_dirs": exported_framework_dirs,
+                "total_files": total_files,
+                "total_size": total_size,
+            }
+            
+            metadata_file = export_dir / 'metadata.json'
+            metadata_file.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding='utf-8'
+            )
+            
+            # 5. 创建ZIP包
+            zip_path = temp_dir / f"{export_name}.zip"
+            files_to_zip = [export_dir]
+            
+            success, error_msg = create_zip_archive(files_to_zip, zip_path, temp_dir)
+            if not success:
+                return False, {}, error_msg
+            
+            # 6. 移动ZIP包到最终位置
+            final_zip_path = Path(TMP_PATH) / f"{export_name}.zip"
+            final_zip_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(zip_path, final_zip_path)
+
+            # 7. 清理多余的ZIP文件
+            try:
+                total_zip_files, deleted_count, deleted_file_list = cleanup_zip_files_by_count()
+                cleanup_info = f"ZIP文件清理: 总数={total_zip_files}, 删除={deleted_count}"
+                if deleted_count > 0:
+                    logger.info(cleanup_info)
+                else:
+                    logger.debug(cleanup_info)
+            except Exception as e:
+                logger.warning(f"ZIP文件清理失败，但不影响导出: {e}")
+
+            # 8. 生成结果
+            result = {
+                "filename": f"{export_name}.zip",
+                "success": True,
+                "message": "导出成功"
+            }
+            
+            logger.info(f"框架数据导出完成: {final_zip_path}")
+            logger.info(f"框架数据导出metadata: {metadata_file}")
+            logger.info(f"导出统计: 账户数={len(exported_accounts)}, 数据目录数={len(exported_data_dirs)}, "
+                       f"框架目录数={len(exported_framework_dirs)}, 总文件数={total_files}")
+            logger.info(f"导出的框架目录: {exported_framework_dirs}")
+            
+            return True, result, ""
+            
+        finally:
+            # 清理临时目录
+            cleanup_temp_directory(temp_dir)
+    
+    except Exception as e:
+        logger.error(f"导出框架数据失败: {e}")
+        return False, {}, f"导出失败: {str(e)}"
+
+
+def import_framework_data(zip_file_path: Path, target_framework_status) -> Tuple[bool, Dict, str]:
+    """
+    从ZIP包导入框架数据
+    
+    Args:
+        zip_file_path: ZIP文件路径
+        target_framework_status: 目标框架状态对象
+
+    Returns:
+        tuple: (success: bool, result: dict, error_msg: str)
+    """
+    logger.info(f"开始导入框架数据: {zip_file_path} -> {target_framework_status.framework_name}")
+    
+    try:
+        # 获取目标框架路径
+        target_framework_path = Path(target_framework_status.path)
+        
+        if not target_framework_path.exists():
+            error_msg = f'目标框架路径不存在: {target_framework_path}'
+            logger.error(error_msg)
+            return False, {}, error_msg
+        
+        # 创建临时目录
+        temp_dir = create_temp_directory("qronos_import_")
+        
+        try:
+            # 1. 解压ZIP文件
+            success, error_msg, extracted_files = extract_zip_archive(zip_file_path, temp_dir)
+            if not success:
+                return False, {}, error_msg
+            
+            # 2. 查找并验证解压后的数据目录
+            export_data_dir = None
+            for item in temp_dir.iterdir():
+                if item.is_dir() and (item / 'metadata.json').exists():
+                    export_data_dir = item
+                    break
+            
+            if not export_data_dir:
+                error_msg = "ZIP包中未找到有效的导出数据"
+                logger.error(error_msg)
+                return False, {}, error_msg
+            
+            # 3. 读取并验证元数据
+            metadata_file = export_data_dir / 'metadata.json'
+            try:
+                metadata = json.loads(metadata_file.read_text(encoding='utf-8'))
+            except Exception as e:
+                error_msg = f"读取元数据失败: {e}"
+                logger.error(error_msg)
+                return False, {}, error_msg
+            
+            logger.info(f"导入数据元信息: 源框架={metadata.get('source_framework_name')}, "
+                       f"账户数={len(metadata.get('exported_accounts', []))}")
+            
+            # 4. 导入数据
+            imported_accounts = []
+            updated_paths = []
+            errors = []
+            
+            # 导入accounts目录
+            accounts_source = export_data_dir / 'accounts'
+            if accounts_source.exists():
+                accounts_target = target_framework_path / 'accounts'
+                accounts_target.mkdir(parents=True, exist_ok=True)
+                
+                for file in accounts_source.iterdir():
+                    if file.is_file():
+                        target_file = accounts_target / file.name
+                        
+                        try:
+                            # 对于JSON文件，需要更新framework_id
+                            if file.suffix == '.json':
+                                account_data = json.loads(file.read_text(encoding='utf-8'))
+                                old_framework_id = account_data.get('framework_id')
+                                account_data['framework_id'] = target_framework_status.framework_id
+                                
+                                target_file.write_text(
+                                    json.dumps(account_data, ensure_ascii=False, indent=2),
+                                    encoding='utf-8'
+                                )
+                                
+                                if old_framework_id != target_framework_status.framework_id:
+                                    updated_paths.append(f"{file.name}: framework_id")
+                                
+                                if not file.name.startswith('_'):
+                                    imported_accounts.append(file.stem)
+                            else:
+                                shutil.copy2(file, target_file)
+                            
+                            logger.debug(f"已导入账户文件: {file.name}")
+                            
+                        except Exception as e:
+                            error_msg = f"导入账户文件失败 {file.name}: {e}"
+                            errors.append(error_msg)
+                            logger.error(error_msg)
+            
+            # 导入data目录
+            data_source = export_data_dir / 'data'
+            if data_source.exists():
+                data_target = target_framework_path / 'data'
+                data_target.mkdir(parents=True, exist_ok=True)
+                
+                for item in data_source.iterdir():
+                    if item.is_dir():
+                        target_item = data_target / item.name
+                        
+                        try:
+                            if target_item.exists():
+                                shutil.rmtree(target_item)
+                            # 导入时也要排除__pycache__目录（保持一致性）
+                            copied_files = copy_directory_with_filter(
+                                item, 
+                                target_item,
+                                exclude_dirs=["__pycache__"]
+                            )
+                            logger.debug(f"已导入数据目录: {item.name} (文件数: {copied_files})")
+                        except Exception as e:
+                            error_msg = f"导入数据目录失败 {item.name}: {e}"
+                            errors.append(error_msg)
+                            logger.error(error_msg)
+            
+            # 导入框架核心目录 (factors, positions, sections, signals)
+            framework_dirs = ['factors', 'positions', 'sections', 'signals']
+            imported_framework_dirs = []
+            
+            for dir_name in framework_dirs:
+                source_dir = export_data_dir / dir_name
+                if source_dir.exists() and source_dir.is_dir():
+                    target_dir = target_framework_path / dir_name
+                    
+                    try:
+                        # 如果目标目录已存在，先删除
+                        if target_dir.exists():
+                            shutil.rmtree(target_dir)
+                        
+                        # 复制框架目录，排除__pycache__
+                        copied_files = copy_directory_with_filter(
+                            source_dir, 
+                            target_dir,
+                            exclude_dirs=["__pycache__"]
+                        )
+                        imported_framework_dirs.append(dir_name)
+                        logger.debug(f"已导入框架目录: {dir_name} (排除: __pycache__, 文件数: {copied_files})")
+                        
+                    except Exception as e:
+                        error_msg = f"导入框架目录失败 {dir_name}: {e}"
+                        errors.append(error_msg)
+                        logger.error(error_msg)
+                else:
+                    logger.debug(f"导出包中不包含框架目录: {dir_name}")
+            
+            # 导入并更新config.json
+            config_source = export_data_dir / 'config.json'
+            if config_source.exists():
+                try:
+                    config_data = json.loads(config_source.read_text(encoding='utf-8'))
+                    
+                    # 更新framework_id
+                    old_framework_id = config_data.get('framework_id')
+                    config_data['framework_id'] = target_framework_status.framework_id
+                    
+                    # 更新realtime_data_path
+                    from db.db_ops import get_finished_data_center_status
+                    data_center_status = get_finished_data_center_status()
+                    if data_center_status and data_center_status.path:
+                        old_data_path = config_data.get('realtime_data_path')
+                        new_data_path = str(Path(data_center_status.path) / 'data')
+                        config_data['realtime_data_path'] = new_data_path
+                        
+                        if old_data_path != new_data_path:
+                            updated_paths.append(f"config.json: realtime_data_path")
+                    
+                    # 保存更新后的config.json
+                    config_target = target_framework_path / 'config.json'
+                    config_target.write_text(
+                        json.dumps(config_data, ensure_ascii=False, indent=2),
+                        encoding='utf-8'
+                    )
+                    
+                    if old_framework_id != target_framework_status.framework_id:
+                        updated_paths.append(f"config.json: framework_id")
+                    
+                    logger.info("已导入并更新config.json")
+                    
+                except Exception as e:
+                    error_msg = f"导入config.json失败: {e}"
+                    errors.append(error_msg)
+                    logger.error(error_msg)
+            else:
+                error_msg = f"压缩包中config.json不存在"
+                errors.append(error_msg)
+                logger.error(error_msg)
+            
+            # 7. 生成结果
+            result = {
+                "imported_accounts": imported_accounts,
+                "imported_framework_dirs": imported_framework_dirs,
+                "updated_paths": updated_paths,
+                "errors": errors,
+                "success": len(errors) == 0,
+                "message": "导入成功" if len(errors) == 0 else f"导入完成，但有{len(errors)}个错误"
+            }
+            
+            logger.info(f"框架数据导入完成: 成功导入 {len(imported_accounts)} 个账户, "
+                       f"{len(imported_framework_dirs)} 个框架目录")
+            if imported_framework_dirs:
+                logger.info(f"导入的框架目录: {imported_framework_dirs}")
+            if updated_paths:
+                logger.info(f"已更新路径: {updated_paths}")
+            if errors:
+                logger.warning(f"导入错误: {errors}")
+            
+            return True, result, ""
+            
+        finally:
+            # 清理临时目录
+            cleanup_temp_directory(temp_dir)
+    
+    except Exception as e:
+        logger.error(f"导入框架数据失败: {e}")
+        return False, {}, f"导入失败: {str(e)}"

@@ -47,31 +47,36 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import (
-    FastAPI, HTTPException, Request, Response, BackgroundTasks, UploadFile, File
+    FastAPI, HTTPException, Request, BackgroundTasks, UploadFile, File
 )
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import FileResponse
 
+from config import MAX_DEVICES_PER_USER
 from db.db import init_db
 from db.db_ops import (
     get_framework_status, get_all_framework_status, delete_framework_status, get_finished_data_center_status,
     del_user_token, get_user, save_google_secret, get_all_finished_framework_status
 )
+from db.device_ops import register_or_update_device, kick_device as kick_device_op
 from model.enum_kit import StatusEnum, UploadFolderEnum
 from model.model import (
     LoginRequest, ResponseModel, DataCenterCfgModel, BasicCodeOperateModel, AccountModel, FrameworkCfgModel,
-    ApiKeySecretModel
+    ApiKeySecretModel, DeviceInfo
 )
 from service.basic_code import (
     generate_account_py_file_from_config, extract_variables_from_py,
     generate_account_py_file_from_json, process_framework_account_statistics,
-    migrate_framework_data
+    migrate_framework_data, export_framework_data, import_framework_data
 )
 from service.command import (
     get_pm2_list, del_pm2, get_pm2_env
 )
 from service.xbx_api import XbxAPI, TokenExpiredException
-from utils.auth import google_login, AuthMiddleware
-from utils.constant import DATA_CENTER_ID, PREFIX, CACHE_CODE_FILE, LOCAL_CODE_FILE, SELECT_COIN_ID
+from utils.auth import google_login, AuthMiddleware, get_current_user_from_request
+from utils.constant import DATA_CENTER_ID, PREFIX, CACHE_CODE_FILE, LOCAL_CODE_FILE, SELECT_COIN_ID, TMP_PATH
+from utils.device_parser import parse_device_info
+from utils.gcode import verify_google_code
 from utils.log_kit import get_logger
 from service.log_parser import parse_data_center_logs
 
@@ -227,32 +232,50 @@ def first():
 
 
 @app.post(f"/{PREFIX}/login")
-def login(body: LoginRequest, response: Response):
+def login(body: LoginRequest, request: Request):
     """
     用户登录接口
     
     使用Google Authenticator进行2FA认证登录。
     支持首次登录时绑定Google Secret Key。
+    集成多设备登录支持，自动解析设备信息并注册设备。
     
     :param body: 登录请求数据
     :type body: LoginRequest
-    :param response: HTTP响应对象
-    :type response: Response
+    :param request: HTTP请求对象
+    :type request: Request
     :return: 登录结果和JWT token
     :rtype: ResponseModel
     
     Process:
-        1. 验证Google Authenticator代码
-        2. 生成JWT访问token
-        3. 保存用户认证信息
-        4. 添加wx_token到响应头
-        5. 返回token和用户信息
+        1. 解析设备信息（设备类型、浏览器、IP等）
+        2. 验证Google Authenticator代码
+        3. 生成包含设备信息的JWT访问token
+        4. 注册/更新设备记录
+        5. 保存用户认证信息
+        6. 返回token和用户信息
     """
     logger.info(f"用户登录请求，参数: {body}")
 
     try:
-        # 执行Google登录验证
-        data = google_login(getattr(body, 'google_secret_key', None), getattr(body, 'code', None))
+        # 解析设备信息
+        device_info = parse_device_info(request)
+        device_id = device_info["device_id"]
+        
+        logger.info(f"设备信息解析完成: 类型={device_info['device_type']}, "
+                   f"浏览器={device_info['browser_info']}, IP={device_info['ip_address']}")
+
+        # 获取用户信息
+        user = get_user()
+        user_id = user.id if user else None
+
+        # 执行Google登录验证（包含设备信息）
+        data = google_login(
+            getattr(body, 'google_secret_key', None), 
+            getattr(body, 'code', None),
+            device_id=device_id,
+            user_id=user_id
+        )
         logger.info("Google认证验证成功")
 
         # 保存Google Secret Key到数据库
@@ -261,9 +284,24 @@ def login(body: LoginRequest, response: Response):
             logger.warning("Google Secret Key已存在，拒绝重复绑定")
             return ResponseModel.error(msg="已经绑定过 secret，请勿重复绑定")
 
-        is_bind = False
-        # 获取用户信息并添加wx_token到响应头
+        # 重新获取用户信息（可能是首次注册）
         user = get_user()
+        if user and user_id is None:
+            user_id = user.id
+
+        # 注册/更新设备信息
+        if user_id:
+            register_or_update_device(
+                device_id=device_id,
+                user_id=user_id,
+                device_type=device_info["device_type"],
+                browser_info=device_info["browser_info"],
+                ip_address=device_info["ip_address"],
+                token=data.get('access_token')
+            )
+
+        is_bind = False
+        # 检查用户绑定状态
         if user:
             # 没有 apikey， uuid， token，需要重新扫码
             if not (user.apikey and user.apikey and user.xbx_token):
@@ -276,7 +314,7 @@ def login(body: LoginRequest, response: Response):
                 except Exception as e:
                     is_bind = False
 
-        logger.info("用户登录成功，token已生成")
+        logger.info("用户登录成功，token已生成，设备已注册")
         return ResponseModel.ok(data={**data, **{'is_bind': is_bind}})
 
     except Exception as e:
@@ -302,6 +340,136 @@ def logout():
     except Exception as e:
         logger.error(f"用户登出失败: {e}")
         return ResponseModel.error(msg=f"登出失败: {str(e)}")
+
+
+@app.get(f"/{PREFIX}/user/devices")
+def get_user_devices(request: Request):
+    """
+    获取用户设备列表接口
+    
+    返回当前用户的所有活跃设备信息，包括设备类型、浏览器信息、
+    IP地址、最后活跃时间等。当前设备会被标记出来。
+    
+    :param request: HTTP请求对象
+    :type request: Request
+    :return: 设备列表响应
+    :rtype: ResponseModel
+    
+    Returns:
+        ResponseModel:
+            - data: DeviceListResponse 包含设备列表和统计信息
+                - devices: 设备信息列表
+                - total_count: 总设备数量
+                - max_devices: 最大设备数量限制
+    """
+    logger.info("获取用户设备列表请求")
+    
+    try:
+        # 从请求中获取当前用户信息
+        current_user = get_current_user_from_request(request)
+        
+        if not current_user:
+            logger.error("无法获取当前用户信息")
+            return ResponseModel.error(msg="用户信息获取失败")
+        
+        user_id = current_user.get("user_id")
+        current_device_id = current_user.get("device_id")
+        
+        if not user_id:
+            logger.error("用户ID不存在")
+            return ResponseModel.error(msg="用户ID无效")
+        
+        # 获取用户设备列表
+        from db.device_ops import get_user_devices
+        devices_data = get_user_devices(user_id)
+        
+        # 标记当前设备
+        for device in devices_data:
+            if device["id"] == current_device_id:
+                device["is_current"] = True
+        
+        # 构造响应数据
+        device_list = [DeviceInfo(**device) for device in devices_data]
+        
+        logger.info(f"成功获取设备列表，共{len(device_list)}个设备")
+        return ResponseModel.ok(data=dict(
+            devices=device_list,
+            total_count=len(device_list),
+            max_devices=MAX_DEVICES_PER_USER
+        ))
+        
+    except Exception as e:
+        logger.error(f"获取用户设备列表失败: {e}")
+        return ResponseModel.error(msg=f"获取设备列表失败: {str(e)}")
+
+
+@app.delete(f"/{PREFIX}/user/device")
+def kick_device(device_id: str, google_code: str, request: Request):
+    """
+    踢设备下线接口
+    
+    将指定设备踢下线，使其token失效。需要Google Code验证确保安全性。
+    不能踢当前设备下线。
+    
+    :param device_id: 要踢下线的设备ID
+    :type device_id: str
+    :param google_code: 谷歌验证码
+    :type google_code: str
+    :param request: HTTP请求对象
+    :type request: Request
+    :return: 踢设备结果
+    :rtype: ResponseModel
+    
+    Security:
+        - 需要有效的JWT token
+        - 需要Google Authenticator验证码
+        - 不能踢自己的设备
+    """
+    logger.info(f"踢设备下线请求: 设备ID={device_id}")
+    
+    try:
+        # 从请求中获取当前用户信息
+        current_user = get_current_user_from_request(request)
+        
+        if not current_user:
+            logger.error("无法获取当前用户信息")
+            return ResponseModel.error(msg="用户信息获取失败")
+        
+        user_id = current_user.get("user_id")
+        current_device_id = current_user.get("device_id")
+        
+        if not user_id:
+            logger.error("用户ID不存在")
+            return ResponseModel.error(msg="用户ID无效")
+        
+        # 检查是否尝试踢自己的设备
+        if device_id == current_device_id:
+            logger.warning(f"尝试踢当前设备: {device_id}")
+            return ResponseModel.error(msg="不能踢当前设备下线")
+        
+        # 验证Google Code
+        user = get_user()
+        if not user or not user.secret:
+            logger.error("用户Google Secret不存在")
+            return ResponseModel.error(msg="用户认证信息异常")
+        
+        if not verify_google_code(user.secret, google_code):
+            logger.warning("Google验证码错误")
+            return ResponseModel.error(msg="Google验证码错误")
+        
+        # 踢设备下线
+        success = kick_device_op(device_id, user_id)
+        
+        if success:
+            logger.info(f"设备踢下线成功: {device_id}")
+            return ResponseModel.ok(msg="设备已踢下线")
+        else:
+            logger.error(f"设备踢下线失败: {device_id}")
+            return ResponseModel.error(msg="设备不存在或踢下线失败")
+        
+    except Exception as e:
+        logger.error(f"踢设备下线失败: {e}")
+        return ResponseModel.error(msg=f"踢设备下线失败: {str(e)}")
 
 
 @app.post(f"/{PREFIX}/user/info")
@@ -343,7 +511,10 @@ def user_info(request: Request, background_tasks: BackgroundTasks):
 
             logger.info("XBX系统登录成功，启动数据中心下载任务")
             # 后台任务：下载最新数据中心代码
-            background_tasks.add_task(api.download_data_center_latest)
+            data_center_status = get_finished_data_center_status()
+            # 不存在数据中心 or 数据中心下载未成功
+            if not (data_center_status and data_center_status.status == StatusEnum.FINISHED):
+                background_tasks.add_task(api.download_data_center_latest)
 
             return ResponseModel.ok(data=data)
         else:
@@ -388,7 +559,7 @@ def get_basic_code():
 
         # 过滤掉数据中心框架
         data = result.get('data', [])
-        filtered_data = [item for item in data if not item.get('id') in [DATA_CENTER_ID, SELECT_COIN_ID]]
+        filtered_data = [item for item in data if not item.get('id') in [SELECT_COIN_ID]]
 
         # 过滤版本列表，只保留time大于2025-06-01的版本（6月份更新的代码，配合当前框架可以使用）
         # 0.2.0版本，更新了账户统计接口，需要限制仓管框架版本必须要 1.3.4 版本, 2025-07-14
@@ -780,26 +951,6 @@ def basic_code_status():
     except Exception as e:
         logger.error(f"获取框架运行状态失败: {e}")
         return ResponseModel.error(msg=f'获取框架运行状态失败, {e}')
-
-
-@app.get(f"/{PREFIX}/basic_code/cfg/overview")
-def basic_code_detail(framework_id: str):
-    """
-    获取框架配置概览
-    
-    获取指定框架的详细配置信息。
-    
-    :param framework_id: 框架ID
-    :type framework_id: str
-    :return: 框架配置信息
-    :rtype: ResponseModel
-    
-    Note:
-        当前为占位实现，后续可扩展具体配置信息
-    """
-    logger.info(f"获取框架配置概览: {framework_id}")
-    # TODO: 实现具体的配置概览逻辑
-    return ResponseModel.ok()
 
 
 # ========== 上传文件(时序因子/截面因子/仓管策略) ==========
@@ -1556,7 +1707,7 @@ def basic_code_account_binding_strategy(framework_id: str, account_name: str, fi
             return ResponseModel.error(msg=f'框架未下载完成')
 
         account_path = Path(framework_status.path) / 'accounts' / f'{account_name}.json'
-        config_path = Path(framework_status.path) / 'config.json'
+        # config_path = Path(framework_status.path) / 'config.json'
 
         if not account_path.exists():
             logger.error(f"账户配置文件不存在: {account_path}")
@@ -1745,6 +1896,144 @@ def basic_code_data_migration(raw_framework_id: str, target_framework_id: str):
         return ResponseModel.error(msg=f"数据迁移失败: {str(e)}")
 
 
+@app.get(f"/{PREFIX}/basic_code/data/export")
+def basic_code_data_export(framework_id: str, export_name: Optional[str] = None):
+    """
+    框架数据导出接口
+    
+    将指定框架的账户配置和数据导出为ZIP包。
+    包括accounts目录下的配置文件、data目录下的用户数据（排除snapshot）以及框架配置文件。
+    
+    :param framework_id: 要导出的框架ID
+    :type framework_id: str
+    :param export_name: 导出包名称（可选，默认使用时间戳）
+    :type export_name: Optional[str]
+    :return: 导出结果
+    :rtype: ResponseModel
+    
+    Process:
+        1. 验证框架存在性和权限
+        2. 收集需要导出的数据
+        3. 创建ZIP包
+        4. 返回导出结果
+    """
+    logger.info(f"开始框架数据导出: 框架={framework_id}, 导出名称={export_name}")
+    
+    try:
+        # 验证框架状态
+        framework_status = get_framework_status(framework_id)
+        if not framework_status or not framework_status.path:
+            logger.error(f"框架未下载完成或路径为空: {framework_id}")
+            return ResponseModel.error(msg=f'框架 {framework_id} 未下载完成')
+        
+        # 调用导出服务
+        success, result, error_msg = export_framework_data(framework_status, export_name)
+        
+        if success:
+            logger.info(f"框架数据导出成功: {result.get('export_file_path')}")
+            return ResponseModel.ok(data=result, msg="导出成功")
+        else:
+            logger.error(f"框架数据导出失败: {error_msg}")
+            return ResponseModel.error(msg=error_msg)
+    
+    except Exception as e:
+        logger.error(f"框架数据导出接口异常: {e}")
+        return ResponseModel.error(msg=f"导出失败: {str(e)}")
+
+
+@app.get(f"/{PREFIX}/basic_code/data/download")
+def download_file(filename: str):
+    """下载导出的zip文件"""
+    try:
+        if not filename.endswith(".zip"):
+            filename += ".zip"
+
+        file_path = TMP_PATH / filename
+
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="文件不存在")
+
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type='application/zip'
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"文件下载失败: {e}")
+        raise HTTPException(status_code=500, detail="文件下载失败")
+
+
+@app.post(f"/{PREFIX}/basic_code/data/import")
+def basic_code_data_import(framework_id: str, file: UploadFile = File(...)):
+    """
+    框架数据导入接口
+    
+    从上传的ZIP包导入框架数据到指定的目标框架。
+    支持自动更新路径配置以适应目标服务器环境。
+    
+    :param framework_id: 目标框架ID
+    :type framework_id: str
+    :param file: 上传的ZIP文件
+    :type file: UploadFile
+    :return: 导入结果
+    :rtype: ResponseModel
+    
+    Process:
+        1. 验证目标框架状态
+        2. 保存上传的ZIP文件
+        3. 解压并验证数据
+        4. 导入数据并更新路径配置
+        5. 返回导入结果
+    """
+    logger.info(f"开始框架数据导入: 目标框架={framework_id}, 文件={file.filename}")
+    
+    try:
+        # 验证目标框架状态
+        target_framework_status = get_framework_status(framework_id)
+        if not target_framework_status or not target_framework_status.path:
+            logger.error(f"目标框架未下载完成或路径为空: {framework_id}")
+            return ResponseModel.error(msg=f'目标框架 {framework_id} 未下载完成')
+        
+        # 验证上传文件
+        if not file.filename or not file.filename.endswith('.zip'):
+            logger.error(f"无效的上传文件: {file.filename}")
+            return ResponseModel.error(msg="请上传有效的ZIP文件")
+        
+        temp_zip_path = Path(TMP_PATH) / f"import_{framework_id}_{int(time.time())}.zip"
+        temp_zip_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            # 保存上传的文件
+            with open(temp_zip_path, "wb") as buffer:
+                content = file.file.read()
+                buffer.write(content)
+            
+            logger.info(f"上传文件已保存到: {temp_zip_path}")
+            
+            # 调用导入服务
+            success, result, error_msg = import_framework_data(temp_zip_path, target_framework_status)
+
+            if success:
+                logger.info(f"框架数据导入成功: 导入账户数={len(result.get('imported_accounts', []))}")
+                return ResponseModel.ok(data=result, msg=result.get('message', '导入成功'))
+            else:
+                logger.error(f"框架数据导入失败: {error_msg}")
+                return ResponseModel.error(msg=error_msg)
+                
+        finally:
+            # 清理临时文件
+            if temp_zip_path.exists():
+                temp_zip_path.unlink(missing_ok=True)
+                logger.debug(f"已清理临时文件: {temp_zip_path}")
+    
+    except Exception as e:
+        logger.error(f"框架数据导入接口异常: {e}")
+        return ResponseModel.error(msg=f"导入失败: {str(e)}")
+
+
 @app.get(f"/{PREFIX}/data_center/operations")
 def get_data_center_operations(framework_id: str, hours: Optional[int] = 24):
     """
@@ -1800,4 +2089,11 @@ if __name__ == "__main__":
     logger.info("数据库初始化完成")
 
     logger.info(f"启动FastAPI服务器，地址: 0.0.0.0:8000/{PREFIX}")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=8000, 
+        reload=False,
+        proxy_headers=True,
+        forwarded_allow_ips="*"
+    )

@@ -27,7 +27,8 @@
 - 支持数据模型转换
 
 """
-
+import random
+from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from db.db import SessionLocal, FrameworkStatus, User
 from model.enum_kit import StatusEnum
@@ -217,6 +218,10 @@ def update_user_xbx_token(token: str) -> bool:
             user = db.query(User).first()
             if user:
                 user.xbx_token = token
+                user.xbx_token_expiry_time = (
+                        datetime.now().replace(second=0, microsecond=0)
+                        + timedelta(hours=7, minutes=random.randint(0,59))
+                )
                 db.commit()
                 logger.info("用户XBX token更新成功")
                 return True
@@ -533,6 +538,51 @@ def get_framework_status(framework_id: str) -> Optional[FrameworkStatus]:
     except Exception as e:
         logger.error(f"获取框架状态失败: {e}")
         return None
+
+
+def clean_old_data_center_records() -> int:
+    """
+    清理旧的数据中心记录
+    
+    保留最新的数据中心记录，删除其他旧记录。
+    确保数据库中只存在一条数据中心记录。
+    
+    :return: 删除的记录数量
+    :rtype: int
+    """
+    logger.info("开始清理旧的数据中心记录")
+    
+    try:
+        with SessionLocal() as db:
+            # 获取所有已完成的数据中心记录，按ID降序排序
+            all_data_centers = db.query(FrameworkStatus).filter_by(
+                type='data_center', 
+                status=StatusEnum.FINISHED
+            ).order_by(FrameworkStatus.id.desc()).all()
+            
+            if len(all_data_centers) <= 1:
+                logger.info(f"数据中心记录数量正常: {len(all_data_centers)}条")
+                return 0
+            
+            # 保留第一条（最新的），删除其余的
+            latest_record = all_data_centers[0]
+            old_records = all_data_centers[1:]
+            
+            logger.warning(f"发现多条数据中心记录，保留最新记录 (ID: {latest_record.id})，删除 {len(old_records)} 条旧记录")
+            
+            deleted_count = 0
+            for old_record in old_records:
+                logger.info(f"删除旧数据中心记录: ID={old_record.id}, 名称={old_record.framework_name}")
+                db.delete(old_record)
+                deleted_count += 1
+            
+            db.commit()
+            logger.info(f"成功清理 {deleted_count} 条旧数据中心记录")
+            return deleted_count
+            
+    except Exception as e:
+        logger.error(f"清理旧数据中心记录失败: {e}")
+        return 0
 
 
 def delete_framework_status(framework_id: str) -> bool:
