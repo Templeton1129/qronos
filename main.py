@@ -67,11 +67,13 @@ from model.model import (
 from service.basic_code import (
     generate_account_py_file_from_config, extract_variables_from_py,
     generate_account_py_file_from_json, process_framework_account_statistics,
-    migrate_framework_data, export_framework_data, import_framework_data
+    migrate_framework_data, export_framework_data, import_framework_data, detect_config_file_type,
+    extract_variables_from_coin_config
 )
 from service.command import (
     get_pm2_list, del_pm2, get_pm2_env
 )
+from service.data_center_upgrade import upgrade_data_center
 from service.xbx_api import XbxAPI, TokenExpiredException
 from utils.auth import google_login, AuthMiddleware, get_current_user_from_request
 from utils.constant import DATA_CENTER_ID, PREFIX, CACHE_CODE_FILE, LOCAL_CODE_FILE, SELECT_COIN_ID, TMP_PATH
@@ -79,6 +81,7 @@ from utils.device_parser import parse_device_info
 from utils.gcode import verify_google_code
 from utils.log_kit import get_logger
 from service.log_parser import parse_data_center_logs
+from utils.version import version_prompt, sys_version
 
 # 初始化日志记录器
 logger = get_logger()
@@ -551,7 +554,7 @@ def get_basic_code():
 
     try:
         api = XbxAPI.get_instance()
-        result = api.get_basic_code_version()
+        result = api.get_basic_code_version(sys_version)
 
         if result.get("error") == "token_invalid":
             logger.error("获取基础代码版本失败：XBX token无效")
@@ -563,7 +566,8 @@ def get_basic_code():
 
         # 过滤版本列表，只保留time大于2025-06-01的版本（6月份更新的代码，配合当前框架可以使用）
         # 0.2.0版本，更新了账户统计接口，需要限制仓管框架版本必须要 1.3.4 版本, 2025-07-14
-        time_threshold = "2025-07-14"
+        # 0.5.0版本，更新了一些新功能，需要限制仓管框架版本必须要 1.3.8 版本, 2025-11-14
+        time_threshold = "2025-11-14"
         for framework in filtered_data:
             versions = framework.get('versions', [])
             # 过滤版本：只保留time大于threshold的版本
@@ -855,6 +859,7 @@ def basic_code_operate(operate: BasicCodeOperateModel):
         - log: 获取框架日志
     """
     logger.info(f"框架操作请求: {operate.framework_id}, 操作类型: {operate.type}")
+    env = get_pm2_env()
 
     try:
         if operate.type in ["start", "stop", "restart"]:
@@ -865,9 +870,16 @@ def basic_code_operate(operate: BasicCodeOperateModel):
                 logger.error(f"框架未下载完成: {operate.framework_id}")
                 return ResponseModel.error(msg=f'框架未下载完成')
 
-            config_json = Path(framework_status.path) / 'config.json'
-            if not config_json.exists():
+            config_json_path = Path(framework_status.path) / 'config.json'
+            if not config_json_path.exists():
                 return ResponseModel.error(msg=f'当前框架未导入策略配置，禁止实盘启停操作')
+
+            config_json = json.loads(config_json_path.read_text(encoding='utf-8'))
+            logger.info(f"config_json: {config_json}")
+            # 配置了加密，并且前端传了加密密钥
+            if operate.secret_key and config_json.get('is_encrypt', False):
+                logger.info(f"前端传入密钥，需要进行解密操作")
+                env['X3S_TRADING_SECRET_KEY'] = operate.secret_key
 
             # 检查PM2进程列表
             data = get_pm2_list()
@@ -879,33 +891,36 @@ def basic_code_operate(operate: BasicCodeOperateModel):
                 logger.info(f"使用配置文件启动PM2: {startup_config}")
 
                 try:
-                    result = subprocess.run(f"pm2 start {startup_config}", env=get_pm2_env(),
+                    result = subprocess.run(f"pm2 start {startup_config}", env=env,
                                             shell=True, capture_output=True, text=True)
                     logger.info(f'PM2启动结果: {result.stdout}')
                     if result.stderr:
                         logger.warning(f'PM2启动警告: {result.stderr}')
 
                     # 启动后直接保存并返回，不需要再执行额外操作
-                    subprocess.Popen(f"pm2 save -f", env=get_pm2_env(), shell=True)
+                    subprocess.Popen(f"pm2 save -f", env=env, shell=True)
                     return ResponseModel.ok(data=f"框架已启动并使用namespace配置")
                 except Exception as e:
                     logger.error(f'PM2启动异常: {e}')
                     return ResponseModel.error(msg=f"PM2启动失败: {str(e)}")
             else:
                 # 执行对namespace的操作（支持PM2 namespace功能）
-                command = f"pm2 {operate.type} {operate.framework_id}"
+                operate_id = operate.framework_id if operate.pm_id is None else operate.pm_id
+                command = f"pm2 {operate.type} {operate_id}"
                 logger.info(f"执行PM2命令: {command}")
-                subprocess.Popen(command, env=get_pm2_env(), shell=True)
+                subprocess.Popen(command, env=env, shell=True)
                 logger.info(f"PM2操作已执行: {operate.type}")
-                subprocess.Popen(f"pm2 save -f", env=get_pm2_env(), shell=True)
+                subprocess.Popen(f"pm2 save -f", env=env, shell=True)
                 return ResponseModel.ok(data=f"{operate.type} 命令已执行")
 
         elif operate.type == "log":
-            logger.info(f"获取框架日志: {operate.framework_id}, 行数: {operate.lines}")
+            # 执行对namespace的操作（支持PM2 namespace功能）
+            operate_id = operate.framework_id if operate.pm_id is None else operate.pm_id
+            logger.info(f"获取框架日志: {operate_id}, 行数: {operate.lines}")
 
             try:
-                log_command = f"pm2 logs {operate.framework_id} --lines {operate.lines} --nostream"
-                result = subprocess.run(log_command, env=get_pm2_env(), shell=True,
+                log_command = f"pm2 logs {operate_id} --lines {operate.lines} --nostream"
+                result = subprocess.run(log_command, env=env, shell=True,
                                         capture_output=True, text=True, timeout=30)
 
                 logger.info(f"成功获取框架日志，输出长度: {len(result.stdout)}")
@@ -1082,7 +1097,7 @@ def basic_code_global_config(framework_cfg: FrameworkCfgModel):
         - is_debug: 是否启用调试模式
         - error_webhook_url: 错误通知webhook地址
     """
-    logger.info(f"保存框架全局配置: 框架={framework_cfg.framework_id}, 调试模式={framework_cfg.is_debug}")
+    logger.info(f"保存框架全局配置: 框架={framework_cfg.framework_id}, 模式={framework_cfg.is_simulate}")
 
     try:
         # 验证框架下载状态
@@ -1112,6 +1127,60 @@ def basic_code_global_config(framework_cfg: FrameworkCfgModel):
         # 保存JSON配置文件
         config_json_path = Path(framework_status.path) / 'config.json'
         config_data = framework_cfg.model_dump()
+
+        # 先读一下之前配置
+        if config_json_path.exists():
+            config_data_old = json.loads(config_json_path.read_text(encoding='utf-8'))
+            if config_data_old.get('is_encrypt', False) and not framework_cfg.is_encrypt:
+                logger.info(f"准备清除账户 apikey. {config_data_old} \n {framework_cfg.is_encrypt}")
+                # 老配置是加密，新配置是不加密，清除所有账户的 apiKey/secret 数据
+                accounts_folder = Path(framework_status.path) / 'accounts'
+
+                if accounts_folder.exists():
+                    logger.warning(f"检测到加密配置变更: is_encrypt True -> False，开始清空所有账户的 apiKey/secret")
+
+                    cleared_accounts = []
+                    failed_accounts = []
+
+                    # 遍历所有账户配置文件
+                    for json_file in accounts_folder.glob('*.json'):
+                        account_name = json_file.stem
+
+                        try:
+                            # 读取账户配置
+                            account_json = json.loads(json_file.read_text(encoding='utf-8'))
+
+                            # 清空 apiKey 和 secret
+                            if 'account_config' in account_json:
+                                account_json['account_config']['apiKey'] = ""
+                                account_json['account_config']['secret'] = ""
+
+                                # 保存 JSON 文件
+                                json_file.write_text(
+                                    json.dumps(account_json, ensure_ascii=False, indent=2),
+                                    encoding='utf-8'
+                                )
+
+                                # 重新生成 Python 文件
+                                generate_account_py_file_from_json(
+                                    account_name,
+                                    account_json,
+                                    accounts_folder,
+                                    update_mode=False
+                                )
+
+                                cleared_accounts.append(account_name)
+                                logger.info(f"已清空账户 {account_name} 的 apiKey/secret")
+
+                        except Exception as e:
+                            failed_accounts.append(account_name)
+                            logger.error(f"清空账户 {account_name} 的 apiKey/secret 失败: {e}")
+
+                    # 记录最终结果
+                    logger.warning(f"成功清空 {len(cleared_accounts)} 个账户的 apiKey/secret: {cleared_accounts}")
+                    logger.error(f"清空失败的账户 ({len(failed_accounts)} 个): {failed_accounts}")
+                else:
+                    logger.info(f"accounts 目录不存在，跳过清空操作: {accounts_folder}")
 
         config_json_path.write_text(
             json.dumps(config_data, ensure_ascii=False, indent=2),
@@ -1721,18 +1790,34 @@ def basic_code_account_binding_strategy(framework_id: str, account_name: str, fi
         content = file.file.read().decode("utf-8")
         logger.info(f"策略文件内容长度: {len(content)}")
 
-        # 定义需要提取的字段映射
-        all_key_map = {
-            "strategy_name_from_strategy": "strategy_name",  # 实盘文件中的字段
-            "strategy_name_from_backtest": "backtest_name",  # 回测文件中的字段
-            "strategy_config": "strategy_config",
-            "strategy_pool": "strategy_pool",
-            "error_webhook_url": "error_webhook_url",
-            "rebalance_mode": "rebalance_mode",
-            "simulator_config": "simulator_config"
-        }
+        # === 新增：检测配置文件类型 ===
+        file_type = detect_config_file_type(content)
+        logger.info(f"检测到配置文件类型: {file_type}")
 
-        extracted, err = extract_variables_from_py(content, all_key_map)
+        # === 根据文件类型选择不同的处理逻辑 ===
+        if file_type == 'pos':
+            # Pos 格式：使用原有逻辑
+            logger.info("使用 Pos 格式处理逻辑")
+            # 定义需要提取的字段映射
+            all_key_map = {
+                "strategy_name_from_strategy": "strategy_name",  # 实盘文件中的字段
+                "strategy_name_from_backtest": "backtest_name",  # 回测文件中的字段
+                "strategy_config": "strategy_config",
+                "strategy_pool": "strategy_pool",
+                "error_webhook_url": "error_webhook_url",
+                "rebalance_mode": "rebalance_mode",
+                "simulator_config": "simulator_config"
+            }
+            extracted, err = extract_variables_from_py(content, all_key_map)
+        else:
+            # Coin 格式：使用新的转换逻辑
+            logger.info("使用 Coin 格式处理逻辑（转换为 Pos 格式）")
+            # 使用文件名（去掉扩展名）作为默认策略名称
+            import os
+            default_name = os.path.splitext(file.filename)[0] if file.filename else account_name
+            logger.info(f"默认策略名称: {default_name}")
+            extracted, err = extract_variables_from_coin_config(content, account_name, default_name)
+
         if err:
             logger.error(f"策略文件解析失败: {err}")
             return ResponseModel.error(msg=err)
@@ -1794,7 +1879,7 @@ def basic_code_account_binding_strategy(framework_id: str, account_name: str, fi
 
 
 @app.get(f"/{PREFIX}/basic_code/all_account/statistics")
-def basic_code_all_account_statistics():
+def basic_code_all_account_statistics(query_days: int):
     """
     获取所有框架下的账户统计信息
     
@@ -1811,7 +1896,7 @@ def basic_code_all_account_statistics():
     for framework_status in get_all_finished_framework_status():
         try:
             # 调用封装的函数处理单个框架的账户统计
-            framework_accounts = process_framework_account_statistics(framework_status)
+            framework_accounts = process_framework_account_statistics(framework_status, query_days)
             result.extend(framework_accounts)
         except Exception as e:
             logger.error(f"处理框架 {framework_status.framework_id} 的账户统计失败: {e}")
@@ -1822,7 +1907,7 @@ def basic_code_all_account_statistics():
 
 
 @app.get(f"/{PREFIX}/basic_code/account/statistics")
-def basic_code_account_statistics(framework_id: str):
+def basic_code_account_statistics(framework_id: str, query_days: int):
     """
     获取指定框架下的账户统计信息
 
@@ -1837,7 +1922,7 @@ def basic_code_account_statistics(framework_id: str):
     framework_status = get_framework_status(framework_id)
     try:
         # 调用封装的函数处理单个框架的账户统计
-        framework_accounts = process_framework_account_statistics(framework_status)
+        framework_accounts = process_framework_account_statistics(framework_status, query_days)
         return ResponseModel.ok(data=framework_accounts)
     except Exception as e:
         logger.error(f"处理框架 {framework_status.framework_id} 的账户统计失败: {e}")
@@ -2081,8 +2166,50 @@ def get_data_center_operations(framework_id: str, hours: Optional[int] = 24):
         return ResponseModel.error(msg=f"获取操作日志失败: {str(e)}")
 
 
+@app.get(f"/{PREFIX}/data_center/upgrade")
+def basic_code_data_center_upgrade():
+    """
+    数据中心升级接口
+    
+    执行数据中心的完整升级流程，包括版本检查、服务停止、配置更新、
+    数据迁移和服务重启等步骤。
+    
+    :return: 升级结果响应
+    :rtype: ResponseModel
+    
+    升级流程：
+        1. 检查并下载最新数据中心版本
+        2. 停止当前数据中心和运行中的实盘框架
+        3. 更新所有实盘框架的数据中心路径配置
+        4. 迁移数据目录和配置文件
+        5. 重启数据中心和实盘框架服务
+    
+    错误处理：
+        - 重启服务前的错误：可重新调用接口
+        - 重启服务后的错误：不回滚，直接报错
+    """
+    logger.info("数据中心升级请求")
+    
+    try:
+        # 执行升级主流程
+        success, message = upgrade_data_center()
+        
+        if success:
+            logger.info(f"数据中心升级成功: {message}")
+            return ResponseModel.ok(msg=message)
+        else:
+            logger.error(f"数据中心升级失败: {message}")
+            return ResponseModel.error(msg=message)
+            
+    except Exception as e:
+        logger.error(f"数据中心升级接口异常: {e}")
+        return ResponseModel.error(msg=f"升级接口异常: {str(e)}")
+
+
 if __name__ == "__main__":
     import uvicorn
+
+    version_prompt()
 
     logger.info("初始化数据库...")
     init_db()

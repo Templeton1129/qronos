@@ -19,7 +19,7 @@ from utils.zip_utils import (
 logger = get_logger()
 
 
-def process_framework_account_statistics(framework_status):
+def process_framework_account_statistics(framework_status, query_days: int) -> list:
     """
     处理单个框架的账户统计信息
     
@@ -27,6 +27,7 @@ def process_framework_account_statistics(framework_status):
     
     Args:
         framework_status: 框架状态对象，包含框架ID、路径等信息
+        query_days: 查询最近多少天
         
     Returns:
         list: 该框架下所有账户的统计信息列表
@@ -88,33 +89,43 @@ def process_framework_account_statistics(framework_status):
             if equity_path.exists():
                 try:
                     df: pd.DataFrame = pd.read_pickle(equity_path)
-                    equity_start_time = df['time'].min()
-                    
-                    # 计算24小时数据
-                    last_24h_df = df[df['time'] > df['time'].max() - pd.Timedelta(hours=24)]
-                    _filter_24h_df = last_24h_df.loc[last_24h_df['type'] == 'log']
-                    if not _filter_24h_df.empty:
-                        account_info['eq_pct_24h'] = round(100 * (_filter_24h_df.iloc[-1]['账户总净值'] / _filter_24h_df.iloc[0]['账户总净值'] - 1), 2)
-                        account_info['eq_pnl_24h'] = round(_filter_24h_df.iloc[-1]['账户总净值'] - _filter_24h_df.iloc[0]['账户总净值'], 2)
-                        account_info['eq_max_24h'] = _filter_24h_df['账户总净值'].max()
-                        account_info['eq_min_24h'] = _filter_24h_df['账户总净值'].min()
 
-                    # 格式化资金曲线数据
-                    df['time'] = df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
-                    df.rename(columns={
-                        '账户总净值': 'equity_amount',
-                        '多头选币': 'long_coin_num', '空头选币': 'short_coin_num',
-                        '多头仓位': 'long_pos_val', '空头仓位': 'short_pos_val',
-                    }, inplace=True)
-                    
-                    cols = ['equity_amount', 'long_pos_val', 'short_pos_val', 'long_coin_num', 'short_coin_num', 'net',
-                            'max2here', 'dd2here', 'long_ratio', 'short_ratio', 'empty_ratio']
-                    for col in cols:
-                        if col in df.columns:
-                            df[col] = df[col].round(2)
-                    
-                    df_dict = df[['time', *[col for col in cols if col in df.columns]]].to_dict('list')
-                    account_info['equity'] = df_dict
+                    # 数据裁切
+                    if query_days:
+                        df = df[df['time'] >= datetime.now() - pd.Timedelta(days=query_days)]
+
+                    if df.empty:
+                        account_info['equity'] = None
+                    else:
+                        equity_start_time = df['time'].min()
+                        # 计算24小时数据
+                        last_24h_df = df[df['time'] > df['time'].max() - pd.Timedelta(hours=24)]
+                        _filter_24h_df = last_24h_df.loc[last_24h_df['type'] == 'log']
+                        if not _filter_24h_df.empty:
+                            account_info['eq_pct_24h'] = round(100 * (_filter_24h_df.iloc[-1]['账户总净值'] / _filter_24h_df.iloc[0]['账户总净值'] - 1), 2)
+                            account_info['eq_pnl_24h'] = round(_filter_24h_df.iloc[-1]['账户总净值'] - _filter_24h_df.iloc[0]['账户总净值'], 2)
+                            account_info['eq_max_24h'] = _filter_24h_df['账户总净值'].max()
+                            account_info['eq_min_24h'] = _filter_24h_df['账户总净值'].min()
+
+                        # 格式化资金曲线数据
+                        df['time'] = df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                        df['net'] = (df['净值'] - 1) * 100
+                        df['max2here'] = df['净值'].expanding().max()
+                        df['dd2here'] = (df['净值'] / df['max2here'] - 1) * 100
+                        df.rename(columns={
+                            '账户总净值': 'equity_amount',
+                            '多头选币': 'long_coin_num', '空头选币': 'short_coin_num',
+                            '多头仓位': 'long_pos_val', '空头仓位': 'short_pos_val',
+                        }, inplace=True)
+
+                        cols = ['equity_amount', 'long_pos_val', 'short_pos_val', 'long_coin_num', 'short_coin_num', 'net',
+                                'max2here', 'dd2here', 'long_ratio', 'short_ratio', 'empty_ratio']
+                        for col in cols:
+                            if col in df.columns:
+                                df[col] = df[col].round(2)
+
+                        df_dict = df[['time', *[col for col in cols if col in df.columns]]].to_dict('list')
+                        account_info['equity'] = df_dict
                     
                 except Exception as e:
                     logger.error(f"处理 {account_name} 资金曲线数据失败: {e}")
@@ -138,7 +149,7 @@ def process_framework_account_statistics(framework_status):
             
             # 处理现货持仓数据
             pos_spot_path = account_info_path / 'pos_spot.pkl'
-            if pos_spot_path.exists():
+            if pos_spot_path.exists() and equity_start_time:
                 try:
                     pos_spot = pd.read_pickle(pos_spot_path)
                     if pos_spot:
@@ -152,7 +163,7 @@ def process_framework_account_statistics(framework_status):
             
             # 处理合约持仓数据
             pos_swap_path = account_info_path / 'pos_swap.pkl'
-            if pos_swap_path.exists():
+            if pos_swap_path.exists() and equity_start_time:
                 try:
                     pos_swap = pd.read_pickle(pos_swap_path)
                     if pos_swap:
@@ -166,7 +177,7 @@ def process_framework_account_statistics(framework_status):
 
             # 处理持仓盈亏数据
             pnl_history_path = account_info_path / 'pnl_history.pkl'
-            if pnl_history_path.exists():
+            if pnl_history_path.exists() and equity_start_time:
                 try:
                     pnl_history = pd.read_pickle(pnl_history_path)
                     account_info['pnl_history'] = pnl_history if pnl_history else {}
@@ -710,6 +721,234 @@ def ast_eval_node(node):
             return result
         except Exception:
             return f"<unparseable>"
+
+
+def detect_config_file_type(content: str) -> str:
+    """
+    检测配置文件类型
+
+    通过检查文件中是否存在 strategy_pool 变量来判断文件类型。
+
+    Args:
+        content: 配置文件内容
+
+    Returns:
+        'pos' - 仓位管理框架格式（有 strategy_pool）
+        'coin' - 选币框架格式（无 strategy_pool）
+    """
+    try:
+        tree = ast.parse(content)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == 'strategy_pool':
+                        return 'pos'
+        return 'coin'
+    except Exception as e:
+        logger.warning(f"解析配置文件时出错，默认按 coin 类型处理: {e}")
+        return 'coin'
+
+
+def extract_variables_from_coin_config(content: str, account_name: str, default_strategy_name: str = None) -> Tuple[Dict, Optional[str]]:
+    """
+    从 Coin 类型配置文件中提取变量并转换为 Pos 格式
+
+    支持两种 Coin 配置格式：
+    1. coin1（实盘多账户）：有 account_config 字典
+    2. coin2（回测）：顶层变量直接定义
+
+    Args:
+        content: 配置文件内容
+        account_name: 账户名称（用于日志记录）
+        default_strategy_name: 默认策略名称，当文件中没有 backtest_name 时使用
+
+    Returns:
+        (dict, str): (提取的变量字典, 错误信息)
+        成功时错误信息为 None
+    """
+    result = {}
+
+    try:
+        # 创建 Mock 类型
+        class MockPath:
+            def __init__(self, *args):
+                pass
+            def __truediv__(self, other):
+                return self
+            def exists(self):
+                return False
+
+        class MockOS:
+            @staticmethod
+            def cpu_count():
+                return 8
+
+            class path:
+                @staticmethod
+                def abspath(p):
+                    return '/mock/absolute/path'
+                @staticmethod
+                def dirname(p):
+                    return '/mock/dir'
+                @staticmethod
+                def join(*args):
+                    return '/'.join(args)
+
+        # 创建一个智能的 __import__ 函数
+        def mock_import(name, *args, **kwargs):
+            """模拟导入，返回包含所需属性的 Mock 模块"""
+            # 为不同的模块返回不同的 Mock
+            if name == 'pathlib':
+                return type('MockPathlibModule', (), {'Path': MockPath})()
+            elif name == 'core.utils.path_kit' or 'path_kit' in name:
+                return type('MockPathKitModule', (), {
+                    'get_folder_path': lambda *args, **kwargs: '/mock/path'
+                })()
+            elif name == 'os':
+                return MockOS
+            elif name == 'time':
+                return type('MockTimeModule', (), {
+                    'localtime': lambda *args, **kwargs: type('MockLocalTime', (), {'tm_gmtoff': 28800})(),
+                })()
+            else:
+                # 通用 Mock 模块，支持任意属性访问
+                class UniversalMock:
+                    def __getattr__(self, item):
+                        # 返回一个灵活的 Mock 对象
+                        def mock_method(*args, **kwargs):
+                            # 返回 self 以支持链式调用
+                            return self
+                        return mock_method
+                    def __call__(self, *args, **kwargs):
+                        return self
+                return UniversalMock()
+
+        # 创建安全的执行环境
+        safe_globals = {
+            "__builtins__": {
+                '__import__': mock_import,
+                'print': lambda *args, **kwargs: None,  # Mock print，不输出
+                'exit': lambda *args, **kwargs: None,  # Mock exit，不退出
+                'int': int,
+                'float': float,
+                'str': str,
+                'bool': bool,
+                'dict': dict,
+                'list': list,
+                'tuple': tuple,
+                'set': set,
+                'range': range,
+                'max': max,
+                'min': min,
+                'len': len,
+                'sum': sum,
+                'abs': abs,
+                'round': round,
+                'True': True,
+                'False': False,
+                'None': None,
+                'type': type,
+                'isinstance': isinstance,
+            },
+            'dict': dict,
+            'list': list,
+            'tuple': tuple,
+            'set': set,
+            'range': range,
+            'max': max,
+            'min': min,
+            'len': len,
+            'sum': sum,
+            'abs': abs,
+            'round': round,
+            'True': True,
+            'False': False,
+            'None': None,
+        }
+
+        safe_locals = {}
+        # 添加一些特殊变量
+        safe_globals['__file__'] = '/mock/config.py'
+        safe_globals['__name__'] = '__main__'
+
+        exec(content, safe_globals, safe_locals)
+
+        # 1. 提取 backtest_name（如果没有则使用默认值）
+        backtest_name = safe_locals.get('backtest_name')
+        if not backtest_name:
+            if default_strategy_name:
+                backtest_name = default_strategy_name
+                logger.info(f"文件中未找到 backtest_name，使用默认值: {backtest_name}")
+            else:
+                return {}, "Coin类型配置文件必须包含 backtest_name 属性，或提供默认策略名称"
+        else:
+            logger.info(f"提取到 backtest_name: {backtest_name}")
+
+        # 2. 检测是否有 account_config（区分 coin1 和 coin2）
+        account_config = safe_locals.get('account_config')
+
+        # 3. 提取 strategy_list
+        strategy_list = None
+        if account_config and isinstance(account_config, dict):
+            # coin1 类型：从第一个账户提取
+            logger.info("检测到 account_config，按 coin1 类型（实盘多账户）处理")
+            if not account_config:
+                return {}, "account_config 不能为空"
+
+            first_account_config = list(account_config.values())[0]
+            strategy_list = first_account_config.get('strategy_list')
+            logger.info(f"从第一个账户配置中提取 strategy_list，包含 {len(strategy_list) if strategy_list else 0} 个策略")
+        else:
+            # coin2 类型：从顶层提取
+            logger.info("未检测到 account_config，按 coin2 类型（回测）处理")
+            strategy_list = safe_locals.get('strategy_list')
+            logger.info(f"从顶层提取 strategy_list，包含 {len(strategy_list) if strategy_list else 0} 个策略")
+
+        if not strategy_list:
+            return {}, "配置文件缺少 strategy_list 属性"
+
+        # 4. 构造 strategy_pool（转换为 pos 格式）
+        result['strategy_pool'] = [{
+            'name': backtest_name,
+            'strategy_list': strategy_list
+        }]
+        logger.info(f"构造 strategy_pool 完成")
+
+        # 5. 设置 strategy_name
+        result['strategy_name_from_backtest'] = backtest_name
+
+        # 6. 构造固定的 strategy_config
+        result['strategy_config'] = {
+            'name': 'FixedRatioStrategy',
+            'hold_period': '1H',
+            'cap_ratios': [1]
+        }
+        logger.info("设置固定的 strategy_config")
+
+        # 7. 提取其他变量（保持原有逻辑）
+        optional_vars = {
+            'get_kline_num': safe_locals.get('get_kline_num'),
+            'min_kline_num': safe_locals.get('min_kline_num'),
+            'leverage': safe_locals.get('leverage'),
+            'black_list': safe_locals.get('black_list'),
+            'white_list': safe_locals.get('white_list'),
+            'rebalance_mode': safe_locals.get('rebalance_mode'),
+        }
+
+        # 只添加非 None 的变量
+        for key, value in optional_vars.items():
+            if value is not None:
+                result[key] = value
+                logger.info(f"提取到 {key}: {value}")
+
+        logger.info(f"Coin 配置文件转换完成，提取到 {len(result)} 个字段")
+        return result, None
+
+    except Exception as e:
+        error_msg = f"解析 Coin 配置文件失败: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        return {}, error_msg
 
 
 def extract_variables_from_py(content: str, key_map: dict):

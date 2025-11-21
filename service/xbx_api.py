@@ -409,7 +409,7 @@ class XbxAPI:
         return None
 
     @retry_request()
-    def get_basic_code_version(self):
+    def get_basic_code_version(self, version: str = '') -> dict:
         """
         获取基础代码版本信息
         
@@ -447,7 +447,7 @@ class XbxAPI:
             - 返回的数据包含所有框架的版本信息
         """
         self._ensure_token()
-        params = {"token": self.token}
+        params = {"token": self.token, "version": version}
         resp = requests.get(api_qtcls_data_client_basic_code_url, params=params, timeout=10)
 
         # 尝试刷新token

@@ -50,6 +50,8 @@ class BasicCodeStatusModel(BaseModel):
 
 class BasicCodeOperateModel(BaseModel):
     framework_id: str | int
+    pm_id: Optional[str | int] = None
+    secret_key: Optional[str] = None
     lines: int = 50
     type: str
 
@@ -69,6 +71,7 @@ class AccountConfigModel(BaseModel):
     buy_bnb_value: int = 11
     if_transfer_bnb: bool = True
     wechat_webhook_url: str = ''
+    base_margin: dict = {'USDT': 1}  # 基本稳定币保证金
 
 
 class AccountModel(BaseModel):
@@ -115,9 +118,11 @@ class Pm2CfgModel(BaseModel):
 class FrameworkCfgModel(BaseModel):
     framework_id: str
     realtime_data_path: Optional[str] = ''
-    is_debug: bool = False
+    # is_debug: bool = False
     error_webhook_url: str = ''
     factor_col_limit: int = 32
+    is_encrypt: bool = False
+    is_simulate: Optional[str] = 'none'
 
 
 class DeviceInfo(BaseModel):
