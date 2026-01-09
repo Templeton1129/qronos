@@ -28,7 +28,7 @@ api_qtcls_user_info_v2_url = f'{api_qtcls_root_url}/user/info/v2'
 api_qtcls_user_login_token_url = f'{api_qtcls_root_url}/user/login/user_token'
 
 # 获取框架版本号
-api_qtcls_data_client_basic_code_url = f'{api_qtcls_root_url}/download/data-client/basic-code'
+api_qtcls_data_client_basic_code_url = f'{api_qtcls_root_url}/download/data-client/basic-code/v2'
 
 # 获取全量市值数据下载链接
 api_qtcls_data_coin_cap_hist_url = f'{api_qtcls_root_url}/api/data/coin-cap/get-hist-download-link'
@@ -58,17 +58,10 @@ CACHE_CODE_FILE = get_file_path('data', 'code.txt')
 LOCAL_CODE_FILE = get_file_path('code.txt')
 
 """
-框架 id 对应类型
+框架类型
 """
-SELECT_COIN_ID = '6780e5efffed44b938b25671'
-POSITION_ID = '678915a96ae722eaa2fe2ca2'
-DATA_CENTER_ID = '6789163a488832004afe2cda'
-
-FRAMEWORK_TYPE = {
-    SELECT_COIN_ID: 'select_coin',
-    POSITION_ID: 'position',
-    DATA_CENTER_ID: 'data_center',
-}
+POSITION_TYPE = 'position'
+DATA_CENTER_TYPE = 'data_center'
 
 """
 启动实盘的 conda 环境

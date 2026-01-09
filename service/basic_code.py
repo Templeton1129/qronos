@@ -108,6 +108,7 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
                             account_info['eq_min_24h'] = _filter_24h_df['账户总净值'].min()
 
                         # 格式化资金曲线数据
+                        df['time'] = df['time'] + pd.to_timedelta(account_json['account_config']['hour_offset'])
                         df['time'] = df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
                         df['net'] = (df['净值'] - 1) * 100
                         df['max2here'] = df['净值'].expanding().max()

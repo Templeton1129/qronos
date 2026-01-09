@@ -35,7 +35,7 @@ from service.command import create_pm2_cfg
 from utils.constant import (
     api_qtcls_user_login_token_url, api_qtcls_data_client_basic_code_url, api_qtcls_data_coin_cap_hist_url,
     api_qtcls_user_info_url, api_qtcls_basic_code_download_ticket_url, api_qtcls_basic_code_download_link_url,
-    TMP_PATH, FRAMEWORK_TYPE, DATA_CENTER_ID, FRAMEWORK_ROOT_PATH, api_qtcls_user_info_v2_url,
+    TMP_PATH, FRAMEWORK_ROOT_PATH, api_qtcls_user_info_v2_url, DATA_CENTER_TYPE,
 )
 from db.db_ops import (
     get_user, save_user_credentials, update_user_xbx_token, save_framework_status, update_framework_status_and_path,
@@ -505,7 +505,7 @@ class XbxAPI:
             6. 更新数据库状态
             
         note:
-            - 仅处理DATA_CENTER_ID对应的框架
+            - 仅处理数据中心类型对应的框架
             - 自动生成realtime_data应用的PM2配置
             - 下载过程中会更新数据库状态
         """
@@ -515,54 +515,59 @@ class XbxAPI:
             logger.error(f"获取基础代码版本失败: {result.get('error')}")
             return
 
-        # 查找数据中心框架 (ID: '6789163a488832004afe2cda')
+        # 收集所有 data_center 类型的版本
+        all_versions = []
         for item in result.get("data", []):
-            if item.get("id") == DATA_CENTER_ID:
-                if not item.get("versions"):
-                    logger.warning("数据中心无可用版本")
-                    continue
+            if item.get("framework_type") == DATA_CENTER_TYPE:
+                for version in item.get("versions", []):
+                    all_versions.append((version, item.get("framework_type")))
 
-                # 按时间降序排序，获取最新版本
-                sorted_data = sorted(
-                    item.get("versions"),
-                    key=lambda x: datetime.strptime(x['time'], '%Y-%m-%d %H:%M'),
-                    reverse=True
-                )
-                last_data = sorted_data[0]
-                file_info = last_data.get('file')
+        # 检查是否有可用版本
+        if not all_versions:
+            logger.warning("数据中心无可用版本")
+            return
 
-                logger.info(f"找到最新数据中心版本: {file_info.get('name')} ({last_data.get('time')})")
+        # 按时间降序排序，获取最新版本
+        sorted_versions = sorted(
+            all_versions,
+            key=lambda x: datetime.strptime(x[0]['time'], '%Y-%m-%d %H:%M'),
+            reverse=True
+        )
+        last_version, framework_type = sorted_versions[0]
+        file_info = last_version.get('file')
 
-                framework_status = get_framework_status(file_info.get('id'))
-                if framework_status and framework_status.status in [StatusEnum.FINISHED, StatusEnum.DOWNLOADING]:
-                    logger.warning(f'数据库中查询框架已经下载完毕或者正在下载中，跳过当前下载， {framework_status}')
-                    return
+        logger.info(f"找到最新数据中心版本: {file_info.get('name')} ({last_version.get('time')})")
 
-                # 保存下载状态到数据库
-                save_framework_status(
-                    file_info.get('id'),
-                    file_info.get('name'),
-                    StatusEnum.DOWNLOADING,
-                    FRAMEWORK_TYPE.get(item.get("id")),
-                    last_data.get('time')
-                )
+        framework_status = get_framework_status(file_info.get('id'))
+        if framework_status and framework_status.status in [StatusEnum.FINISHED, StatusEnum.DOWNLOADING]:
+            logger.warning(f'数据库中查询框架已经下载完毕或者正在下载中，跳过当前下载， {framework_status}')
+            return
 
-                # 执行下载
-                success, framework_path = self.download_basic_code(file_info.get('id'))
+        # 保存下载状态到数据库
+        save_framework_status(
+            file_info.get('id'),
+            file_info.get('name'),
+            StatusEnum.DOWNLOADING,
+            framework_type,
+            last_version.get('time')
+        )
 
-                # 更新最终状态
-                update_framework_status_and_path(
-                    file_info.get('id'),
-                    StatusEnum.FINISHED if success else StatusEnum.FAILED,
-                    framework_path
-                )
+        # 执行下载
+        success, framework_path = self.download_basic_code(file_info.get('id'))
 
-                if success:
-                    logger.info("数据中心下载成功，生成PM2配置")
-                    # 为数据中心生成PM2配置（仅包含realtime_data应用）
-                    self._create_pm2_config(file_info.get('id'), framework_path, ['realtime_data'])
-                else:
-                    logger.error("数据中心下载失败")
+        # 更新最终状态
+        update_framework_status_and_path(
+            file_info.get('id'),
+            StatusEnum.FINISHED if success else StatusEnum.FAILED,
+            framework_path
+        )
+
+        if success:
+            logger.info("数据中心下载成功，生成PM2配置")
+            # 为数据中心生成PM2配置（仅包含realtime_data应用）
+            self._create_pm2_config(file_info.get('id'), framework_path, ['realtime_data'])
+        else:
+            logger.error("数据中心下载失败")
 
     def download_basic_code_for_id(self, framework_id):
         """
@@ -607,7 +612,7 @@ class XbxAPI:
                         framework_id,
                         file_info.get("name"),
                         StatusEnum.DOWNLOADING,
-                        FRAMEWORK_TYPE.get(item.get("id")),
+                        item.get("framework_type"),
                         version.get("time")
                     )
 
@@ -624,7 +629,7 @@ class XbxAPI:
                     if success:
                         logger.info("框架下载成功，生成PM2配置")
                         # 生成完整的PM2配置
-                        if framework_id == DATA_CENTER_ID:
+                        if item.get("framework_type") == DATA_CENTER_TYPE:
                             self._create_pm2_config(file_info.get('id'), framework_path, ['realtime_data'])
                         else:
                             self._create_pm2_config(framework_id, framework_path, ['startup', 'delist', 'monitor'])

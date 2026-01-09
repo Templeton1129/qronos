@@ -1,4 +1,4 @@
-import{g as D,L as N,h as B,a_ as G,I as $,F as X}from"./index-B3e5YSF3.js";/*!
+import{g as D,L as N,h as B,a_ as G,I as $,F as X}from"./index-DbB14CKm.js";/*!
  * qrcode.vue v3.6.0
  * A Vue.js component to generate QRCode. Both support Vue 2 and Vue 3
  * © 2017-PRESENT @scopewu(https://github.com/scopewu)

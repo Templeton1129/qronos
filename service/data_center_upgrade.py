@@ -27,7 +27,7 @@ from db.db_ops import (
 )
 from service.command import get_pm2_list, get_pm2_env
 from service.xbx_api import XbxAPI
-from utils.constant import DATA_CENTER_ID
+from utils.constant import DATA_CENTER_TYPE
 from utils.log_kit import get_logger
 
 # 初始化日志记录器
@@ -121,7 +121,7 @@ def start_framework_pm2(framework_id: str) -> bool:
         return False
 
 
-def get_running_strategy_frameworks() -> List[str]:
+def get_running_strategy_frameworks(filter_framework_id: str) -> List[str]:
     """
     获取当前运行中的实盘框架ID列表
     
@@ -137,7 +137,7 @@ def get_running_strategy_frameworks() -> List[str]:
         for process in pm2_processes:
             framework_id = process.get('framework_id')
             # 过滤掉数据中心框架
-            if framework_id and framework_id != DATA_CENTER_ID:
+            if framework_id and framework_id != filter_framework_id:
                 running_frameworks.append(framework_id)
         
         logger.info(f"找到运行中的实盘框架: {running_frameworks}")
@@ -322,11 +322,11 @@ def upgrade_data_center() -> Tuple[bool, str]:
         logger.info("步骤3：停止相关服务")
         
         # 获取运行中的实盘框架
-        running_frameworks = get_running_strategy_frameworks()
+        running_frameworks = get_running_strategy_frameworks(old_data_center.framework_id)
         logger.info(f"运行中的实盘框架: {running_frameworks}")
         
         # 停止数据中心
-        if not stop_framework_pm2(DATA_CENTER_ID):
+        if not stop_framework_pm2(old_data_center.framework_id):
             return False, "停止数据中心服务失败"
         
         # 停止所有实盘框架
@@ -341,8 +341,8 @@ def upgrade_data_center() -> Tuple[bool, str]:
         
         # 获取所有已完成的非数据中心框架
         all_frameworks = get_all_finished_framework_status()
-        strategy_frameworks = [fw for fw in all_frameworks if fw.framework_id != DATA_CENTER_ID]
-        
+        strategy_frameworks = [fw for fw in all_frameworks if fw.type != DATA_CENTER_TYPE]
+
         new_data_path = str(Path(new_data_center_path) / 'data')
         logger.info(f"新数据路径: {new_data_path}")
         
@@ -365,7 +365,7 @@ def upgrade_data_center() -> Tuple[bool, str]:
         logger.info("步骤6：重启服务")
         
         # 启动新数据中心
-        if not start_framework_pm2(DATA_CENTER_ID):
+        if not start_framework_pm2(new_data_center.framework_id):
             return False, "重启数据中心服务出错"
         
         # 启动之前运行的实盘框架

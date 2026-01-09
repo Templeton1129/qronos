@@ -76,7 +76,7 @@ from service.command import (
 from service.data_center_upgrade import upgrade_data_center
 from service.xbx_api import XbxAPI, TokenExpiredException
 from utils.auth import google_login, AuthMiddleware, get_current_user_from_request
-from utils.constant import DATA_CENTER_ID, PREFIX, CACHE_CODE_FILE, LOCAL_CODE_FILE, SELECT_COIN_ID, TMP_PATH
+from utils.constant import PREFIX, CACHE_CODE_FILE, LOCAL_CODE_FILE, TMP_PATH
 from utils.device_parser import parse_device_info
 from utils.gcode import verify_google_code
 from utils.log_kit import get_logger
@@ -562,13 +562,12 @@ def get_basic_code():
 
         # 过滤掉数据中心框架
         data = result.get('data', [])
-        filtered_data = [item for item in data if not item.get('id') in [SELECT_COIN_ID]]
 
         # 过滤版本列表，只保留time大于2025-06-01的版本（6月份更新的代码，配合当前框架可以使用）
         # 0.2.0版本，更新了账户统计接口，需要限制仓管框架版本必须要 1.3.4 版本, 2025-07-14
         # 0.5.0版本，更新了一些新功能，需要限制仓管框架版本必须要 1.3.8 版本, 2025-11-14
-        time_threshold = "2025-11-14"
-        for framework in filtered_data:
+        time_threshold = "2025-01-01"
+        for framework in data:
             versions = framework.get('versions', [])
             # 过滤版本：只保留time大于threshold的版本
             filtered_versions = []
@@ -580,10 +579,10 @@ def get_basic_code():
             framework['versions'] = filtered_versions
 
         # 统计过滤后的版本数量
-        total_versions = sum(len(framework.get('versions', [])) for framework in filtered_data)
+        total_versions = sum(len(framework.get('versions', [])) for framework in data)
         logger.info(
-            f"成功获取基础代码版本列表，共{len(filtered_data)}个框架，{total_versions}个版本（时间>{time_threshold}）")
-        return ResponseModel.ok(data=filtered_data)
+            f"成功获取基础代码版本列表，共{len(data)}个框架，{total_versions}个版本（时间>{time_threshold}）")
+        return ResponseModel.ok(data=data)
 
     except TokenExpiredException as e:
         logger.error(f"Token已过期，需要重新认证: {e}")
@@ -728,6 +727,12 @@ def basic_code_query_config(framework_id: str):
         config_json_path = Path(framework_status.path) / 'config.json'
         if config_json_path.exists():
             config_json = json.loads(config_json_path.read_text(encoding='utf-8'))
+            # 针对一些脏数据的 is_simulate 为 null，改成 none
+            if 'is_simulate' in config_json:
+                if config_json.get('is_simulate') is None:
+                    config_json['is_simulate'] = 'none'
+            else:
+                config_json['is_simulate'] = 'debug'
             return ResponseModel.ok(data=config_json)
 
         return ResponseModel.ok()
@@ -872,7 +877,7 @@ def basic_code_operate(operate: BasicCodeOperateModel):
 
             config_json_path = Path(framework_status.path) / 'config.json'
             if not config_json_path.exists():
-                return ResponseModel.error(msg=f'当前框架未导入策略配置，禁止实盘启停操作')
+                return ResponseModel.error(msg=f'当前框架未进行全局配置，禁止实盘启停操作')
 
             config_json = json.loads(config_json_path.read_text(encoding='utf-8'))
             logger.info(f"config_json: {config_json}")
@@ -880,6 +885,12 @@ def basic_code_operate(operate: BasicCodeOperateModel):
             if operate.secret_key and config_json.get('is_encrypt', False):
                 logger.info(f"前端传入密钥，需要进行解密操作")
                 env['X3S_TRADING_SECRET_KEY'] = operate.secret_key
+            else:
+                logger.info(f"前端未密钥，设置为空")
+                env['X3S_TRADING_SECRET_KEY'] = ''
+
+            # 获取启动配置文件路径
+            startup_config = Path(framework_status.path) / 'startup.json'
 
             # 检查PM2进程列表
             data = get_pm2_list()
@@ -887,7 +898,6 @@ def basic_code_operate(operate: BasicCodeOperateModel):
                 logger.info(f"PM2进程不存在，需要先启动: {operate.framework_id}")
 
                 # 启动PM2进程
-                startup_config = Path(framework_status.path) / 'startup.json'
                 logger.info(f"使用配置文件启动PM2: {startup_config}")
 
                 try:
@@ -906,7 +916,18 @@ def basic_code_operate(operate: BasicCodeOperateModel):
             else:
                 # 执行对namespace的操作（支持PM2 namespace功能）
                 operate_id = operate.framework_id if operate.pm_id is None else operate.pm_id
-                command = f"pm2 {operate.type} {operate_id}"
+
+                # 根据操作类型构建命令，start/restart 需要 --update-env 以更新环境变量
+                if operate.type == "start":
+                    # start 使用配置文件启动，确保环境变量被更新
+                    command = f"pm2 start {startup_config} --update-env"
+                elif operate.type == "restart":
+                    # restart 添加 --update-env 参数
+                    command = f"pm2 restart {operate_id} --update-env"
+                else:
+                    # stop 保持原有逻辑
+                    command = f"pm2 stop {operate_id}"
+
                 logger.info(f"执行PM2命令: {command}")
                 subprocess.Popen(command, env=env, shell=True)
                 logger.info(f"PM2操作已执行: {operate.type}")
@@ -2166,7 +2187,7 @@ def get_data_center_operations(framework_id: str, hours: Optional[int] = 24):
         return ResponseModel.error(msg=f"获取操作日志失败: {str(e)}")
 
 
-@app.get(f"/{PREFIX}/data_center/upgrade")
+@app.get(f"/{PREFIX}/basic_code/data_center/upgrade")
 def basic_code_data_center_upgrade():
     """
     数据中心升级接口
