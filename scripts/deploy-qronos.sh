@@ -741,7 +741,7 @@ setup_data_directories() {
     
     # 创建必要的数据目录
     log_info "创建数据目录..."
-    mkdir -p ./data/qronos/data ./data/qronos/logs ./data/firm ./data/.pm2
+    mkdir -p ./data/qronos/data ./data/qronos/logs ./data/firm ./data/.pm2-runtime
     
     # 检测操作系统并设置权限
     log_info "设置目录权限..."
@@ -1410,7 +1410,7 @@ deploy_container() {
         -v $(pwd)/data/qronos/data:/app/qronos/data \
         -v $(pwd)/data/qronos/logs:/app/qronos/logs \
         -v $(pwd)/data/firm:/app/firm \
-        -v $(pwd)/data/.pm2:/app/.pm2"
+        -v $(pwd)/data/.pm2-runtime:/app/.pm2-runtime"
     
     # 在Linux系统上添加用户权限配置
     if [[ "$(uname)" == "Linux" ]] && [[ -n "$CURRENT_UID" ]]; then
