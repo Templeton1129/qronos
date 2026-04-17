@@ -1406,6 +1406,7 @@ deploy_container() {
     # 构建Docker运行命令
     DOCKER_RUN_CMD="docker run -d \
         --name ${CONTAINER_NAME} \
+        --shm-size=2g \
         -p ${RANDOM_PORT}:80 \
         -v $(pwd)/data/qronos/data:/app/qronos/data \
         -v $(pwd)/data/qronos/logs:/app/qronos/logs \

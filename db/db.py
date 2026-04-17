@@ -147,6 +147,10 @@ class FrameworkStatus(Base):
     框架类型：
         - data_center: 数据中心框架
         - strategy: 策略框架
+
+    框架来源：
+        - official: 官方下载
+        - imported: 用户上传导入
     """
     __tablename__ = 'framework_status'
     
@@ -157,6 +161,8 @@ class FrameworkStatus(Base):
     type = Column(String(32), nullable=False, comment="框架类型")
     time = Column(String(32), nullable=False, comment="框架版本时间戳")
     path = Column(String(256), comment="框架本地存储路径")
+    source = Column(String(16), nullable=False, default='official',
+                    comment="框架来源：official=官方下载，imported=用户导入")
 
 
 def init_db():
@@ -184,7 +190,11 @@ def init_db():
         
         # 执行数据库迁移
         _migrate_database()
-        
+
+        # 清理因程序中断而残留的 downloading 状态
+        from db.db_ops import cleanup_interrupted_downloads
+        cleanup_interrupted_downloads()
+
         # 记录创建的表信息
         table_names = [table.name for table in Base.metadata.tables.values()]
         logger.info(f"已创建/验证的数据库表: {', '.join(table_names)}")
@@ -205,10 +215,13 @@ def _migrate_database():
         
         # 检查user表是否需要迁移
         _migrate_user_table()
-        
+
         # 检查device表是否需要创建
         _migrate_device_table()
-        
+
+        # 检查framework_status表是否需要迁移(加 source 列)
+        _migrate_framework_status_table()
+
         logger.info("数据库迁移检查完成")
         
     except Exception as e:
@@ -279,7 +292,41 @@ def _migrate_device_table():
                 logger.info("成功创建device表")
             else:
                 logger.info("device表已存在，无需创建")
-                
+
     except Exception as e:
         logger.error(f"迁移device表失败: {e}")
+        raise
+
+
+def _migrate_framework_status_table():
+    """
+    迁移 framework_status 表结构
+
+    检查是否缺少 source 列，缺少则通过 ALTER TABLE 添加。
+    SQLite 的 DEFAULT 'official' NOT NULL 会自动给存量行回填为 'official'，
+    不需要额外的 UPDATE 语句。
+
+    幂等：重复执行只会在首次加列，后续调用检测到列已存在即跳过。
+    """
+    try:
+        with engine.connect() as conn:
+            # 检查 source 列是否存在
+            result = conn.execute(text("PRAGMA table_info(framework_status)"))
+            columns = [row[1] for row in result.fetchall()]
+
+            if 'source' not in columns:
+                logger.info("检测到 framework_status 表缺少 source 列，开始添加...")
+
+                conn.execute(text(
+                    "ALTER TABLE framework_status "
+                    "ADD COLUMN source VARCHAR(16) NOT NULL DEFAULT 'official'"
+                ))
+                conn.commit()
+
+                logger.info("成功添加 source 列到 framework_status 表，存量行已回填为 'official'")
+            else:
+                logger.info("framework_status 表结构已是最新，无需迁移")
+
+    except Exception as e:
+        logger.error(f"迁移 framework_status 表失败: {e}")
         raise

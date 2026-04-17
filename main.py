@@ -40,11 +40,13 @@
 """
 
 import json
+import os
 import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 from fastapi import (
     FastAPI, HTTPException, Request, BackgroundTasks, UploadFile, File
@@ -69,8 +71,9 @@ from service.basic_code import (
     generate_account_py_file_from_config, extract_variables_from_py,
     generate_account_py_file_from_json, process_framework_account_statistics,
     migrate_framework_data, export_framework_data, import_framework_data, detect_config_file_type,
-    extract_variables_from_coin_config
+    extract_variables_from_coin_config, import_custom_framework
 )
+from service.showcase_statistics import process_account_showcase_statistics
 from service.command import (
     get_pm2_list, del_pm2, get_pm2_env
 )
@@ -775,6 +778,64 @@ def basic_code_download(framework_id: str, background_tasks: BackgroundTasks):
         return ResponseModel.error(msg=f"启动下载任务失败: {str(e)}")
 
 
+@app.post(f"/{PREFIX}/basic_code/import")
+def basic_code_import(framework_name: str, file: UploadFile = File(...)):
+    """
+    导入用户自定义实盘框架 zip 包
+
+    接收前端上传的 zip 文件和用户自定义的框架名称。
+    框架名称（非 zip 文件名）决定 framework_id、目录名和 PM2 命名空间。
+    zip 文件名只需是 .zip 结尾即可，不参与 ID 派生。
+
+    :param framework_name: 用户定义的框架名称，必须符合 usr_<英文数字-_> 格式
+    :type framework_name: str
+    :param file: 上传的 zip 文件
+    :type file: UploadFile
+    :return: 导入结果（成功时 data 含 framework_id/path/entry_scripts 等）
+    :rtype: ResponseModel
+    """
+    logger.info(f"开始导入自定义框架: 名称={framework_name}, 文件={file.filename}")
+
+    # 基础文件校验：只需是 .zip 结尾（框架名称的正则校验在 service 层）
+    if not file.filename or not file.filename.endswith('.zip'):
+        logger.error(f"无效的上传文件: {file.filename}")
+        return ResponseModel.error(msg="请上传有效的 ZIP 文件")
+
+    # 路径遍历防御：拒绝任何含路径分隔符的文件名
+    safe_name = os.path.basename(file.filename)
+    if safe_name != file.filename or '/' in safe_name or '\\' in safe_name:
+        logger.error(f"文件名包含路径分隔符，疑似路径遍历: {file.filename}")
+        return ResponseModel.error(msg="请上传有效的 ZIP 文件")
+
+    # 临时 zip 名使用 uuid 前缀避免并发上传同秒同名覆盖
+    temp_zip_path = Path(TMP_PATH) / f"import_custom_{uuid4().hex[:8]}_{safe_name}"
+    temp_zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # 落盘临时 zip
+        with open(temp_zip_path, "wb") as buffer:
+            buffer.write(file.file.read())
+        logger.info(f"临时 zip 已保存: {temp_zip_path}")
+
+        # 调用编排器（framework_name 由前端定义，zip 文件名不参与 ID 派生）
+        success, data, error_msg = import_custom_framework(temp_zip_path, framework_name=framework_name)
+
+        if success:
+            logger.info(f"自定义框架导入成功: {data.get('framework_id')}")
+            return ResponseModel.ok(data=data, msg="导入成功")
+        else:
+            logger.error(f"自定义框架导入失败: {error_msg}")
+            return ResponseModel.error(msg=error_msg)
+
+    except Exception as e:
+        logger.error(f"导入自定义框架接口异常: {e}")
+        return ResponseModel.error(msg=f"导入失败: {str(e)}")
+    finally:
+        if temp_zip_path.exists():
+            temp_zip_path.unlink(missing_ok=True)
+            logger.debug(f"已清理临时 zip: {temp_zip_path}")
+
+
 @app.get(f"/{PREFIX}/basic_code/download/status")
 def basic_code_download_status():
     """
@@ -905,14 +966,14 @@ def basic_code_operate(operate: BasicCodeOperateModel):
                 logger.info(f"使用配置文件启动PM2: {startup_config}")
 
                 try:
-                    result = subprocess.run(f"pm2 start {startup_config}", env=env,
-                                            shell=True, capture_output=True, text=True)
+                    result = subprocess.run(["pm2", "start", str(startup_config)], env=env,
+                                            capture_output=True, text=True)
                     logger.info(f'PM2启动结果: {result.stdout}')
                     if result.stderr:
                         logger.warning(f'PM2启动警告: {result.stderr}')
 
                     # 启动后直接保存并返回，不需要再执行额外操作
-                    subprocess.Popen(f"pm2 save -f", env=env, shell=True)
+                    subprocess.Popen(["pm2", "save", "-f"], env=env)
                     return ResponseModel.ok(data=f"框架已启动并使用namespace配置")
                 except Exception as e:
                     logger.error(f'PM2启动异常: {e}')
@@ -924,18 +985,18 @@ def basic_code_operate(operate: BasicCodeOperateModel):
                 # 根据操作类型构建命令，start/restart 需要 --update-env 以更新环境变量
                 if operate.type == "start":
                     # start 使用配置文件启动，确保环境变量被更新
-                    command = f"pm2 start {startup_config} --update-env"
+                    command = ["pm2", "start", str(startup_config), "--update-env"]
                 elif operate.type == "restart":
                     # restart 添加 --update-env 参数
-                    command = f"pm2 restart {operate_id} --update-env"
+                    command = ["pm2", "restart", str(operate_id), "--update-env"]
                 else:
                     # stop 保持原有逻辑
-                    command = f"pm2 stop {operate_id}"
+                    command = ["pm2", "stop", str(operate_id)]
 
                 logger.info(f"执行PM2命令: {command}")
-                subprocess.Popen(command, env=env, shell=True)
+                subprocess.Popen(command, env=env)
                 logger.info(f"PM2操作已执行: {operate.type}")
-                subprocess.Popen(f"pm2 save -f", env=env, shell=True)
+                subprocess.Popen(["pm2", "save", "-f"], env=env)
                 return ResponseModel.ok(data=f"{operate.type} 命令已执行")
 
         elif operate.type == "log":
@@ -944,8 +1005,8 @@ def basic_code_operate(operate: BasicCodeOperateModel):
             logger.info(f"获取框架日志: {operate_id}, 行数: {operate.lines}")
 
             try:
-                log_command = f"pm2 logs {operate_id} --lines {operate.lines} --nostream"
-                result = subprocess.run(log_command, env=env, shell=True,
+                log_command = ["pm2", "logs", str(operate_id), "--lines", str(operate.lines), "--nostream"]
+                result = subprocess.run(log_command, env=env,
                                         capture_output=True, text=True, timeout=30)
 
                 logger.info(f"成功获取框架日志，输出长度: {len(result.stdout)}")
@@ -1952,6 +2013,46 @@ def basic_code_account_statistics(framework_id: str, query_days: int):
     except Exception as e:
         logger.error(f"处理框架 {framework_status.framework_id} 的账户统计失败: {e}")
         return ResponseModel.error(msg=f"处理框架 {framework_status.framework_id} 的账户统计失败")
+
+
+@app.get(f"/{PREFIX}/basic_code/account/showcase/statistics")
+def basic_code_account_showcase_statistics(framework_id: str, account_name: str, query_days: int):
+    """
+    获取指定账户的晒单统计信息。
+
+    相比账户统计接口，该接口只返回晒单页需要的单账户汇总和图表数据，
+    包括累计收益率、最大回撤、年化、最近24h收益，以及最近N天的净值、
+    多空比例、多空选币数量和多空敞口数据。
+
+    前端时间 Tab 约定：
+    - 全部：query_days=0
+    - 最近30天：query_days=30
+    - 最近7天：query_days=7
+    """
+    logger.info(
+        f"开始获取账户晒单统计信息: 框架={framework_id}, 账户={account_name}, query_days={query_days}"
+    )
+
+    framework_status = get_framework_status(framework_id)
+    if not framework_status or framework_status.status != StatusEnum.FINISHED or not framework_status.path:
+        return ResponseModel.error(msg=f'框架 {framework_id} 未下载完成')
+
+    try:
+        showcase_data = process_account_showcase_statistics(framework_status, account_name, query_days)
+        return ResponseModel.ok(data=showcase_data)
+    except FileNotFoundError as e:
+        logger.error(f"获取账户晒单统计失败: {e}")
+        return ResponseModel.error(msg=str(e))
+    except ValueError as e:
+        logger.error(f"获取账户晒单统计失败: {e}")
+        return ResponseModel.error(msg=str(e))
+    except Exception as e:
+        logger.error(
+            f"处理框架 {framework_status.framework_id} 账户 {account_name} 的晒单统计失败: {e}"
+        )
+        return ResponseModel.error(
+            msg=f"处理框架 {framework_status.framework_id} 账户 {account_name} 的晒单统计失败"
+        )
 
 
 @app.get(f"/{PREFIX}/basic_code/data/migration")

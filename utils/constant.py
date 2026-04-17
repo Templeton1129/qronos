@@ -73,3 +73,25 @@ ALPHA_ENV_PATH = "/opt/alpha_env/bin/python"
 
 # 接口前缀
 PREFIX = 'qronos'
+
+"""
+导入自定义框架相关常量
+"""
+# 导入框架文件名 / framework_id 的统一前缀
+# 与 zip 文件名、解压后目录名、framework_id 同时一致
+# 保证与官方框架命名空间完全隔离（官方框架都不以 usr_ 开头）
+IMPORTED_FRAMEWORK_PREFIX = 'usr_'
+
+# 实盘策略框架的 PM2 入口脚本集合
+# 下载流程（xbx_api.py）和导入流程（basic_code.py）共用
+STRATEGY_ENTRY_SCRIPTS = ('startup', 'delist', 'monitor')
+
+# 数据中心框架的 PM2 入口脚本集合
+# 仅 xbx_api.py 的数据中心下载流程使用；导入接口禁止导入数据中心
+DATA_CENTER_ENTRY_SCRIPTS = ('realtime_data',)
+
+# 实盘框架必须存在的目录（安全门禁）
+# 导入 zip 解压后会检查这 5 个目录是否全部存在，缺一即拒绝导入
+# 注意：与 UploadFolderEnum (factors/sections/positions/signals) 有 4 个值重叠，
+# 但语义不同（结构契约 vs 上传白名单），故意显式列出不做派生
+REQUIRED_FRAMEWORK_DIRS = ('accounts', 'factors', 'positions', 'sections', 'signals')

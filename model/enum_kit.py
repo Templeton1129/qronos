@@ -36,3 +36,13 @@ class DeviceTypeEnum(str, Enum):
     PC = 'pc'
     MOBILE = 'mobile'
     TABLET = 'tablet'
+
+
+class FrameworkSourceEnum(str, Enum):
+    """
+    框架来源枚举
+
+    区分框架是官方下载还是用户上传导入，用于 framework_status 表的 source 列。
+    """
+    OFFICIAL = 'official'  # 官方下载（XBX API）
+    IMPORTED = 'imported'  # 用户上传导入

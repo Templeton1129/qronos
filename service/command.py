@@ -21,7 +21,7 @@ import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from model.model import Pm2AppModel
+from model.model import Pm2AppModel, Pm2CfgModel
 from utils.constant import CONDA_ENV_NAME, ALPHA_ENV_PATH
 from utils.log_kit import get_logger
 
@@ -59,8 +59,7 @@ def get_pm2_list() -> List[Dict[str, Any]]:
     try:
         # 执行PM2命令获取JSON格式的进程列表
         result = subprocess.run(
-            "pm2 jlist",
-            shell=True,
+            ["pm2", "jlist"],
             env=get_pm2_env(),
             capture_output=True,
             text=True,
@@ -128,7 +127,7 @@ def del_pm2(framework_id: str) -> bool:
 
     try:
         # 使用Popen异步执行删除命令
-        subprocess.Popen(f"pm2 del {framework_id}", env=get_pm2_env(), shell=True)
+        subprocess.Popen(["pm2", "del", str(framework_id)], env=get_pm2_env())
         logger.info(f"PM2删除命令已执行: {framework_id}")
         return True
 
@@ -165,8 +164,7 @@ def get_conda_env(env_name: str = 'Alpha') -> str:
     try:
         logger.debug("尝试查找conda环境...")
         result = subprocess.run(
-            "conda env list",
-            shell=True,
+            ["conda", "env", "list"],
             capture_output=True,
             text=True,
             timeout=30
@@ -194,8 +192,11 @@ def get_conda_env(env_name: str = 'Alpha') -> str:
 
 
 def get_pm2_env() -> dict:
-    # 准备环境变量
-    env = {}
+    # shell=False 时 env 会完全替换子进程环境，需要显式带上 PATH 让系统找到 pm2
+    # 除此之外保持最小化，避免 Python 进程的环境变量干扰 PM2 行为（如 namespace 丢失）
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+    }
 
     # 1. 检查环境变量(容器内)
     if env_home := os.environ.get('PM2_HOME'):
@@ -203,11 +204,10 @@ def get_pm2_env() -> dict:
         return env
 
     # 2. 尝试通过进程检查(调试)
-    env = os.environ.copy()
     try:
         result = subprocess.run(
-            "pm2 info pm2-logrotate",
-            shell=True,
+            ["pm2", "info", "pm2-logrotate"],
+            env=env,
             capture_output=True,
             text=True
         )
@@ -281,3 +281,40 @@ def create_pm2_cfg(app_name: str = 'startup', framework_id: str = '',
     logger.debug(f"配置详情: 脚本={config.script}, 解释器={config.exec_interpreter}")
 
     return config
+
+
+def write_pm2_startup_json(
+    framework_id: str, framework_path: Path, app_names
+) -> Path:
+    """
+    为指定框架生成 PM2 startup.json 配置文件
+
+    供下载流程（service/xbx_api.py）和导入流程（service/basic_code.py）共同调用，
+    消除了两处重复生成 startup.json 的代码。
+
+    :param framework_id: 框架唯一标识，写入 PM2 config 的 namespace 字段
+    :type framework_id: str
+    :param framework_path: 框架本地根目录，startup.json 会被写入此目录
+    :type framework_path: Path
+    :param app_names: 要生成的 app 名字列表（例如 ['startup', 'delist', 'monitor']）
+    :type app_names: Sequence[str]
+    :return: 已写入的 startup.json 文件路径
+    :rtype: Path
+
+    Note:
+        - 内部调用现有的 create_pm2_cfg() 生成每个 app 的配置
+        - 写出的文件名固定为 'startup.json'（与现有约定一致）
+        - 覆盖写入，不做备份
+    """
+    logger.info(f"生成 PM2 startup.json: 框架={framework_id}, app_names={app_names}")
+
+    pm2_cfg = Pm2CfgModel(apps=[
+        create_pm2_cfg(app_name=app_name, framework_id=framework_id, framework_path=framework_path)
+        for app_name in app_names
+    ])
+
+    config_path = framework_path / 'startup.json'
+    config_path.write_text(json.dumps(pm2_cfg.model_dump(), ensure_ascii=False, indent=2))
+
+    logger.info(f"PM2 startup.json 已保存: {config_path}")
+    return config_path

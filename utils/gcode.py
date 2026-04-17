@@ -9,7 +9,6 @@ def google_code(secret_key=''):
 
 def verify_google_code(secret_key, code):
     totp = pyotp.TOTP(secret_key)
-    print(totp.now())
     return totp.verify(code)
 
 

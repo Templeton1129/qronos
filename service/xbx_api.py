@@ -17,7 +17,6 @@ XBX API 服务模块
 
 """
 
-import json
 import os
 import time
 import traceback
@@ -30,12 +29,12 @@ from functools import wraps
 import requests
 
 from model.enum_kit import StatusEnum
-from model.model import Pm2CfgModel
-from service.command import create_pm2_cfg
+from service.command import write_pm2_startup_json
 from utils.constant import (
     api_qtcls_user_login_token_url, api_qtcls_data_client_basic_code_url, api_qtcls_data_coin_cap_hist_url,
     api_qtcls_user_info_url, api_qtcls_basic_code_download_ticket_url, api_qtcls_basic_code_download_link_url,
     TMP_PATH, FRAMEWORK_ROOT_PATH, api_qtcls_user_info_v2_url, DATA_CENTER_TYPE,
+    STRATEGY_ENTRY_SCRIPTS, DATA_CENTER_ENTRY_SCRIPTS,
 )
 from db.db_ops import (
     get_user, save_user_credentials, update_user_xbx_token, save_framework_status, update_framework_status_and_path,
@@ -461,34 +460,6 @@ class XbxAPI:
             return resp.json()
         return {"error": resp.text}
 
-    @staticmethod
-    def _create_pm2_config(framework_id: str, framework_path, app_configs: list):
-        """
-        创建PM2配置文件
-        
-        为下载的框架生成PM2进程管理配置文件。
-        
-        :param framework_id: 框架ID
-        :type framework_id: str
-        :param framework_path: 框架本地路径
-        :type framework_path: Path
-        :param app_configs: 应用配置列表，每个元素是app_name
-        :type app_configs: list
-        
-        note:
-            - 生成的配置文件保存为 startup.json
-            - 支持多个应用的配置
-            - 配置包含启动脚本、日志路径等信息
-        """
-        logger.info(f"为框架 {framework_id} 创建PM2配置，应用列表: {app_configs}")
-        pm2_cfg = Pm2CfgModel(apps=[
-            create_pm2_cfg(app_name=app_name, framework_id=framework_id, framework_path=framework_path)
-            for app_name in app_configs
-        ])
-        config_path = framework_path / 'startup.json'
-        config_path.write_text(json.dumps(pm2_cfg.model_dump(), ensure_ascii=False, indent=2))
-        logger.info(f"PM2配置文件已保存: {config_path}")
-
     def download_data_center_latest(self):
         """
         下载最新的数据中心代码
@@ -552,20 +523,27 @@ class XbxAPI:
             last_version.get('time')
         )
 
-        # 执行下载
-        success, framework_path = self.download_basic_code(file_info.get('id'))
+        # 执行下载，try/except 确保异常时也能将状态更新为 FAILED
+        success = False
+        framework_path = None
+        try:
+            success, framework_path = self.download_basic_code(file_info.get('id'))
 
-        # 更新最终状态
-        update_framework_status_and_path(
-            file_info.get('id'),
-            StatusEnum.FINISHED if success else StatusEnum.FAILED,
-            framework_path
-        )
+            # 更新最终状态
+            update_framework_status_and_path(
+                file_info.get('id'),
+                StatusEnum.FINISHED if success else StatusEnum.FAILED,
+                framework_path
+            )
+        except Exception as e:
+            logger.error(f"数据中心下载过程发生异常: {e}")
+            update_framework_status_and_path(file_info.get('id'), StatusEnum.FAILED, None)
+            return
 
         if success:
             logger.info("数据中心下载成功，生成PM2配置")
             # 为数据中心生成PM2配置（仅包含realtime_data应用）
-            self._create_pm2_config(file_info.get('id'), framework_path, ['realtime_data'])
+            write_pm2_startup_json(file_info.get('id'), framework_path, DATA_CENTER_ENTRY_SCRIPTS)
         else:
             logger.error("数据中心下载失败")
 
@@ -616,23 +594,30 @@ class XbxAPI:
                         version.get("time")
                     )
 
-                    # 执行下载
-                    success, framework_path = self.download_basic_code(framework_id)
+                    # 执行下载，try/except 确保异常时也能将状态更新为 FAILED
+                    success = False
+                    framework_path = None
+                    try:
+                        success, framework_path = self.download_basic_code(framework_id)
 
-                    # 更新最终状态
-                    update_framework_status_and_path(
-                        framework_id,
-                        StatusEnum.FINISHED if success else StatusEnum.FAILED,
-                        framework_path
-                    )
+                        # 更新最终状态
+                        update_framework_status_and_path(
+                            framework_id,
+                            StatusEnum.FINISHED if success else StatusEnum.FAILED,
+                            framework_path
+                        )
+                    except Exception as e:
+                        logger.error(f"框架下载过程发生异常: {e}")
+                        update_framework_status_and_path(framework_id, StatusEnum.FAILED, None)
+                        return
 
                     if success:
                         logger.info("框架下载成功，生成PM2配置")
                         # 生成完整的PM2配置
                         if item.get("framework_type") == DATA_CENTER_TYPE:
-                            self._create_pm2_config(file_info.get('id'), framework_path, ['realtime_data'])
+                            write_pm2_startup_json(file_info.get('id'), framework_path, DATA_CENTER_ENTRY_SCRIPTS)
                         else:
-                            self._create_pm2_config(framework_id, framework_path, ['startup', 'delist', 'monitor'])
+                            write_pm2_startup_json(framework_id, framework_path, STRATEGY_ENTRY_SCRIPTS)
                     else:
                         logger.error("框架下载失败")
                     return

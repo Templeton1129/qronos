@@ -91,3 +91,5 @@ docker-compose*.yml
 *.backup
 .cursorignore
 .cursor/
+.claude/
+.gstack/

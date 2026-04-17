@@ -307,12 +307,41 @@ def del_user_token() -> bool:
         return False
 
 
-def save_framework_status(framework_id: str, name: str, status: str, type_: str, time: str) -> bool:
+def cleanup_interrupted_downloads() -> int:
+    """
+    清理因程序中断而残留的下载中状态记录
+
+    程序启动时不可能有正在进行的下载任务，
+    因此所有 DOWNLOADING 状态的记录都是上次中断残留，需要重置为 FAILED 以允许重新下载。
+
+    :return: 重置的记录数量
+    :rtype: int
+    """
+    try:
+        with SessionLocal() as db:
+            count = db.query(FrameworkStatus).filter_by(
+                status=StatusEnum.DOWNLOADING
+            ).update({FrameworkStatus.status: StatusEnum.FAILED})
+            db.commit()
+
+            if count > 0:
+                logger.warning(f"已将 {count} 条中断残留的 downloading 记录重置为 failed")
+            return count
+    except Exception as e:
+        logger.error(f"清理中断下载记录失败: {e}")
+        return 0
+
+
+def save_framework_status(
+    framework_id: str, name: str, status: str, type_: str, time: str,
+    source: str = 'official',
+    path: Optional[str] = None,
+) -> bool:
     """
     保存框架状态信息
-    
+
     保存或更新框架的状态信息，用于跟踪框架的下载和运行状态。
-    
+
     :param framework_id: 框架唯一标识符
     :type framework_id: str
     :param name: 框架显示名称
@@ -323,6 +352,10 @@ def save_framework_status(framework_id: str, name: str, status: str, type_: str,
     :type type_: str
     :param time: 框架版本时间戳
     :type time: str
+    :param source: 框架来源 ('official' 或 'imported'), 默认 'official'
+    :type source: str
+    :param path: 框架本地存储路径, 默认 None
+    :type path: Optional[str]
     :return: 保存成功返回True，失败返回False
     :rtype: bool
     
@@ -333,8 +366,9 @@ def save_framework_status(framework_id: str, name: str, status: str, type_: str,
         
     Note:
         - 使用framework_id作为唯一标识
-        - 状态更新时只更新status字段
-        - 新建记录时保存所有字段信息
+        - 状态更新时只更新status字段；source/path 刻意不在 update 分支中处理
+          （download 流程依赖两步法：create 插入 DOWNLOADING，update_framework_status_and_path 再写 path）
+        - 新建记录时通过 source/path 参数一次性保存所有字段信息
     """
     logger.info(f"保存框架状态，框架ID: {framework_id}, 状态: {status}")
     
@@ -355,10 +389,12 @@ def save_framework_status(framework_id: str, name: str, status: str, type_: str,
                     framework_name=name,
                     status=status,
                     type=type_,
-                    time=time
+                    time=time,
+                    source=source,
+                    path=path,
                 )
                 db.add(new_status)
-                logger.info(f"创建新框架状态记录: {name} ({type_})")
+                logger.info(f"创建新框架状态记录: {name} ({type_}, source={source})")
             
             db.commit()
             logger.info("框架状态保存成功")

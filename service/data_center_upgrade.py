@@ -47,10 +47,10 @@ def stop_framework_pm2(framework_id: str) -> bool:
     
     try:
         # 执行PM2停止命令
-        command = f"pm2 stop {framework_id}"
+        command = ["pm2", "stop", str(framework_id)]
         logger.debug(f"执行PM2命令: {command}")
-        
-        subprocess.Popen(command, env=get_pm2_env(), shell=True)
+
+        subprocess.Popen(command, env=get_pm2_env())
         logger.info(f"PM2停止命令已执行: {framework_id}")
         return True
         
@@ -90,17 +90,17 @@ def start_framework_pm2(framework_id: str) -> bool:
             logger.info(f"使用配置文件启动PM2: {startup_config}")
             
             try:
-                result = subprocess.run(f"pm2 start {startup_config}", env=get_pm2_env(),
-                                       shell=True, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(["pm2", "start", str(startup_config)], env=get_pm2_env(),
+                                       capture_output=True, text=True, timeout=30)
                 logger.info(f'PM2启动结果: {result.stdout}')
                 if result.stderr:
                     logger.warning(f'PM2启动警告: {result.stderr}')
                 
                 # 保存PM2配置
-                subprocess.Popen(f"pm2 save -f", env=get_pm2_env(), shell=True)
+                subprocess.Popen(["pm2", "save", "-f"], env=get_pm2_env())
                 logger.info(f"框架已启动: {framework_id}")
                 return True
-                
+
             except subprocess.TimeoutExpired:
                 logger.error(f'PM2启动超时: {framework_id}')
                 return False
@@ -109,11 +109,11 @@ def start_framework_pm2(framework_id: str) -> bool:
                 return False
         else:
             # 进程存在，执行start命令
-            command = f"pm2 start {framework_id}"
+            command = ["pm2", "start", str(framework_id)]
             logger.info(f"执行PM2命令: {command}")
-            subprocess.Popen(command, env=get_pm2_env(), shell=True)
+            subprocess.Popen(command, env=get_pm2_env())
             logger.info(f"PM2启动命令已执行: {framework_id}")
-            subprocess.Popen(f"pm2 save -f", env=get_pm2_env(), shell=True)
+            subprocess.Popen(["pm2", "save", "-f"], env=get_pm2_env())
             return True
             
     except Exception as e:

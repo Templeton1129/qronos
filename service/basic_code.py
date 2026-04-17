@@ -1,17 +1,32 @@
 import ast
 import json
 import os
+import re
 import shutil
+import subprocess
 import time as time_mod
 import traceback
+import zipfile
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, List
+from uuid import uuid4
 
 import pandas as pd
 
-from utils.constant import TMP_PATH
+from db.db import FrameworkStatus
+from db.db_ops import get_framework_status, delete_framework_status, save_framework_status
+from model.enum_kit import StatusEnum, FrameworkSourceEnum
+from service.command import write_pm2_startup_json, get_pm2_env
+from utils.constant import (
+    TMP_PATH,
+    FRAMEWORK_ROOT_PATH,
+    POSITION_TYPE,
+    IMPORTED_FRAMEWORK_PREFIX,
+    STRATEGY_ENTRY_SCRIPTS,
+    REQUIRED_FRAMEWORK_DIRS,
+)
 from utils.log_kit import get_logger
 from utils.zip_utils import (
     create_zip_archive, extract_zip_archive, create_temp_directory, cleanup_temp_directory, calculate_directory_size,
@@ -20,13 +35,29 @@ from utils.zip_utils import (
 
 logger = get_logger()
 
+# 导入自定义框架的名称正则：前缀 usr_ + 1~60 位（字母/数字/中文/下划线/连字符）
+# 允许中文以支持用户自定义的友好名称（如 usr_polars版实盘）
+# framework_name 是显示名；framework_id 由 _derive_framework_id 另外派生为纯 ASCII
+_IMPORTED_FRAMEWORK_NAME_RE = re.compile(
+    rf'^{re.escape(IMPORTED_FRAMEWORK_PREFIX)}[\w\u4e00-\u9fff\u3400-\u4dbf\-]{{1,60}}$'
+)
+
 # ===== 账户统计缓存 =====
 _statistics_cache: Dict[tuple, dict] = {}
 _CACHE_TTL = 300  # 缓存过期时间（秒）
 
 
 def _collect_file_mtimes(account_json_path: Path, account_info_path: Path) -> dict:
-    """收集账户相关所有文件的修改时间，用于缓存失效判断"""
+    """
+    收集账户统计依赖文件的修改时间。
+
+    Args:
+        account_json_path: 账户配置文件路径。
+        account_info_path: 账户统计目录路径。
+
+    Returns:
+        dict: 文件路径与修改时间的映射，用于缓存失效判断。
+    """
     mtimes = {}
     for file_path in [
         account_json_path,
@@ -42,8 +73,16 @@ def _collect_file_mtimes(account_json_path: Path, account_info_path: Path) -> di
 
 
 def _is_cache_valid(cache_entry: dict, current_mtimes: dict) -> bool:
-    """校验缓存是否仍然有效"""
-    # 时间过期
+    """
+    判断缓存是否仍然有效。
+
+    Args:
+        cache_entry: 缓存中保存的数据结构。
+        current_mtimes: 当前文件修改时间快照。
+
+    Returns:
+        bool: 未过期且依赖文件未变化时返回 True。
+    """
     if time_mod.time() - cache_entry['ts'] > _CACHE_TTL:
         return False
     # 文件变更
@@ -162,8 +201,14 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
                             '多头仓位': 'long_pos_val', '空头仓位': 'short_pos_val',
                         }, inplace=True)
 
+                        if 'exposure' in df.columns:
+                            exposure_pct = df['exposure'] * 100
+                            df['exposure_long'] = exposure_pct.clip(lower=0)
+                            df['exposure_short'] = exposure_pct.clip(upper=0)
+
                         cols = ['equity_amount', 'long_pos_val', 'short_pos_val', 'long_coin_num', 'short_coin_num', 'net',
-                                'max2here', 'dd2here', 'long_ratio', 'short_ratio', 'empty_ratio']
+                                'max2here', 'dd2here', 'long_ratio', 'short_ratio', 'empty_ratio',
+                                'exposure_long', 'exposure_short']
                         for col in cols:
                             if col in df.columns:
                                 df[col] = df[col].round(2)
@@ -1272,7 +1317,7 @@ def migrate_framework_data(raw_framework_status, target_framework_status):
         logger.info(f"数据迁移完成: 成功迁移 {len(migrated_users)} 个账户，失败 {len(failed_users)} 个账户")
         if migrated_framework_dirs:
             logger.info(f"已迁移框架目录: {migrated_framework_dirs}")
-
+        
         success = len(failed_users) == 0
         error_msg = None if success else f"有 {len(failed_users)} 个账户迁移失败"
         
@@ -1781,3 +1826,341 @@ def import_framework_data(zip_file_path: Path, target_framework_status) -> Tuple
     except Exception as e:
         logger.error(f"导入框架数据失败: {e}")
         return False, {}, f"导入失败: {str(e)}"
+
+
+# =============================================================================
+# 导入自定义框架 - 私有 helpers
+# =============================================================================
+
+def _validate_framework_name(framework_name: str) -> str:
+    """
+    校验前端传入的框架名称。
+
+    规则：framework_name 必须以 usr_ 开头，后接 1~60 位字符（允许中文、英文、数字、下划线、连字符）。
+    通过后返回 framework_name 原值。
+
+    :param framework_name: 前端传入的框架名称（含 usr_ 前缀，可含中文）
+    :raises ValueError: 名称不符合规则
+    """
+    if not _IMPORTED_FRAMEWORK_NAME_RE.fullmatch(framework_name):
+        raise ValueError(
+            f"框架名称必须以 {IMPORTED_FRAMEWORK_PREFIX} 开头，"
+            f"后接英文/数字/中文/-/_（1~60位），当前: {framework_name}"
+        )
+    return framework_name
+
+
+def _derive_framework_id(framework_name: str) -> str:
+    """
+    从 framework_name 确定性派生纯 ASCII 的 framework_id。
+
+    算法: usr_ + sha256(framework_name.encode('utf-8')).hexdigest()[:8]
+
+    确定性保证：同一个 framework_name 总是得到同一个 framework_id，
+    这让"同名覆盖"逻辑天然成立——不需要额外用 name 去 DB 查。
+
+    framework_id 用于 PM2 namespace、磁盘目录名、DB 主键，全部纯 ASCII 安全。
+    """
+    import hashlib
+    name_hash = hashlib.sha256(framework_name.encode('utf-8')).hexdigest()[:8]
+    return f"{IMPORTED_FRAMEWORK_PREFIX}{name_hash}"
+
+
+def _resolve_overwrite_target(framework_id: str) -> Tuple[bool, Optional[FrameworkStatus]]:
+    """
+    查询 framework_status 表判断冲突。
+
+    返回:
+        (overwrite: bool, existing: Optional[FrameworkStatus])
+        - DB 无记录 → (False, None)
+        - 有记录且 source='imported' → (True, existing)
+
+    :raises ValueError: 有记录且 source='official'（与官方框架冲突）
+
+    注意: status 字段不参与判断，只看 source。
+    """
+    existing = get_framework_status(framework_id)
+    if existing is None:
+        return False, None
+    if existing.source == FrameworkSourceEnum.OFFICIAL.value:
+        raise ValueError(
+            f"framework_id 与官方框架冲突，请重命名。framework_id={framework_id}"
+        )
+    return True, existing
+
+
+def _extract_zip_with_gbk_fallback(zip_path: Path, target_dir: Path) -> None:
+    """
+    解压 zip 到 target_dir。target_dir 必须已由调用方 mkdir。
+
+    功能:
+      1. GBK 兜底：检测 ZipInfo flag_bits 的 UTF-8 标志位(0x800)，未设则尝试
+         cp437→gbk 重编码文件名；失败则保留 zipfile 默认解码（非 GBK 编码的兜底）
+      2. zip slip 防护：解压目标路径 resolve 后必须在 target_dir 子树内
+      3. BadZipFile 翻译：zipfile 打开失败 → ValueError("压缩包损坏或不是有效 zip")
+
+    :raises ValueError: zip 损坏 / zip slip 检测命中
+    """
+    target_dir_resolved = target_dir.resolve()
+
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile:
+        raise ValueError("压缩包损坏或不是有效 zip")
+
+    with zf:
+        for zinfo in zf.infolist():
+            # 1. 文件名 GBK 兜底
+            is_utf8 = bool(zinfo.flag_bits & 0x800)
+            name = zinfo.filename
+            if not is_utf8:
+                try:
+                    name = name.encode('cp437').decode('gbk')
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    pass  # 非 GBK 编码(例如 big5)：保留默认解码，可能 mojibake 但不崩溃
+
+            # 2. zip slip 防护：解压后的路径必须仍然在 target_dir 子树内
+            target_path = (target_dir / name).resolve()
+            if target_path != target_dir_resolved and not target_path.is_relative_to(target_dir_resolved):
+                raise ValueError(f"非法 zip 路径，疑似目录遍历攻击: {name}")
+
+            # 3. 写入文件系统
+            if zinfo.is_dir():
+                target_path.mkdir(parents=True, exist_ok=True)
+            else:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(zinfo) as src, open(target_path, 'wb') as dst:
+                    shutil.copyfileobj(src, dst)
+
+
+def _resolve_framework_root(extract_dir: Path) -> Path:
+    """
+    识别 flat / wrapped 布局。
+
+    算法:
+      - 如果 extract_dir 正好只有一个子项且是目录 → 返回该子目录（wrapped，
+        wrapper 名字允许中文）
+      - 其它情况 → 返回 extract_dir 本身（flat）
+
+    该函数不校验内容，仅做布局判定。后续 _validate_framework_structure
+    会校验五个必检目录是否存在。
+    """
+    entries = list(extract_dir.iterdir())
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return extract_dir
+
+
+def _validate_framework_structure(framework_root: Path) -> List[str]:
+    """
+    安全门禁：检查框架目录结构是否合法。
+
+    步骤:
+      1. 检查 REQUIRED_FRAMEWORK_DIRS 五个目录全部存在且是目录；缺失 → ValueError
+      2. 扫描 STRATEGY_ENTRY_SCRIPTS 三个 .py 入口；至少要有一个；全无 → ValueError
+      3. 返回实际存在的入口列表（子集，顺序与 STRATEGY_ENTRY_SCRIPTS 一致）
+
+    :raises ValueError: 必检目录缺失 / 无任何入口脚本
+    """
+    # 1. 检查必检目录
+    missing = [d for d in REQUIRED_FRAMEWORK_DIRS
+               if not (framework_root / d).is_dir()]
+    if missing:
+        raise ValueError(f"缺少必需目录：{', '.join(missing)}")
+
+    # 2. 扫描入口
+    existing_entries = [
+        entry for entry in STRATEGY_ENTRY_SCRIPTS
+        if (framework_root / f'{entry}.py').is_file()
+    ]
+    if not existing_entries:
+        raise ValueError(
+            f"压缩包内未找到 {'/'.join(STRATEGY_ENTRY_SCRIPTS)} 任一入口脚本"
+        )
+    return existing_entries
+
+
+def _cleanup_existing_framework(framework_id: str, old_path: Optional[str]) -> None:
+    """
+    仅在覆盖场景调用。清理旧框架以便同名 framework_id 重用。
+
+    步骤:
+      1. subprocess.run(["pm2", "del", framework_id], timeout=30) 同步等待
+         （不复用 del_pm2 的 Popen 异步模式，避免与 rmtree 的 race，见 spec §4.6）
+         非 0 返回码被容忍（namespace 不存在等情况）
+      2. delete_framework_status(framework_id) 删除 DB 记录
+      3. 若 old_path 非空且存在 → shutil.rmtree(old_path)
+
+    :raises: 步骤 3 的 IOError / PermissionError 原样抛出
+             步骤 1-2 的子异常被 log.warning 吞掉
+    """
+    # 1. 同步停止 pm2 进程
+    # 必须传 env=get_pm2_env()——Docker 容器里 PM2_HOME 非默认路径，
+    # 不传 env 会让 subprocess 打错 daemon，导致进程没真正 kill 掉。
+    try:
+        result = subprocess.run(
+            ["pm2", "del", str(framework_id)],
+            timeout=30,
+            capture_output=True,
+            text=True,
+            env=get_pm2_env(),
+        )
+        if result.returncode != 0:
+            # 用 warning 而非 info：通常意味着 namespace 不存在(可容忍)，
+            # 但也可能是 pm2 daemon 异常 / 权限错(需要排查)，应当让 ops 看到
+            logger.warning(
+                f"pm2 del 返回非 0 (可能因 namespace 不存在，也可能是 daemon 异常): "
+                f"returncode={result.returncode}, stderr={result.stderr}"
+            )
+        else:
+            logger.info(f"pm2 del 成功: {framework_id}")
+    except subprocess.TimeoutExpired:
+        logger.warning(f"pm2 del 超时（30s），继续 cleanup: {framework_id}")
+    except Exception as e:
+        logger.warning(f"pm2 del 异常（容忍）: {e}")
+
+    # 2. 删除 DB 记录
+    try:
+        delete_framework_status(framework_id)
+    except Exception as e:
+        logger.warning(f"delete_framework_status 异常（容忍）: {e}")
+
+    # 3. rmtree 旧目录（IOError / PermissionError 原样抛出给编排器）
+    # 不做 .exists() 短路：覆盖场景下旧目录应当真实存在；如果不存在
+    # （例如被运维手动删过），FileNotFoundError 会上抛由 orchestrator 处理。
+    if old_path:
+        shutil.rmtree(old_path)
+        logger.info(f"已删除旧框架目录: {old_path}")
+
+
+def _install_imported_framework(
+    framework_root: Path, framework_id: str, entry_scripts: List[str]
+) -> Path:
+    """
+    落地 framework 文件到 FRAMEWORK_ROOT_PATH 并生成 PM2 startup.json。
+
+    步骤:
+      1. target_path = FRAMEWORK_ROOT_PATH / framework_id
+      2. 若 target_path 已存在 → rmtree（防御 DB 路径与 FRAMEWORK_ROOT_PATH/framework_id
+         不一致时残留的旧文件，避免与新内容静默合并）
+      3. shutil.copytree(framework_root, target_path, dirs_exist_ok=True)
+         用 copytree 而非 move：源文件留在 extract_dir 由 finally 统一清理
+      4. write_pm2_startup_json(framework_id, target_path, entry_scripts)
+      5. 返回 target_path
+
+    :raises IOError / PermissionError: copytree 或写 json 失败
+    """
+    target_path = FRAMEWORK_ROOT_PATH / framework_id
+    logger.info(f"落地导入框架: {framework_root} → {target_path}")
+
+    # 防御性清理：DB 路径与 FRAMEWORK_ROOT_PATH/framework_id 不一致时，target_path 可能
+    # 已残留旧文件。清掉再 copytree，避免与新内容静默合并。
+    if target_path.exists():
+        logger.warning(f"target_path 已存在，先清理避免脏数据: {target_path}")
+        shutil.rmtree(target_path)
+
+    shutil.copytree(framework_root, target_path, dirs_exist_ok=True)
+
+    write_pm2_startup_json(framework_id, target_path, entry_scripts)
+
+    return target_path
+
+
+def _safe_cleanup(target_path: Optional[Path]) -> None:
+    """
+    编排器 except 分支的幂等清理。
+
+    - target_path 为 None 或不存在 → noop
+    - 存在 → shutil.rmtree(target_path, ignore_errors=True)
+
+    **不碰** extract_dir（由编排器的 finally 块统一清理）。
+    **不碰** 临时 zip（由 main.py 的 finally 块清理）。
+    """
+    if target_path is None:
+        return
+    if not target_path.exists():
+        return
+    shutil.rmtree(target_path, ignore_errors=True)
+
+
+def import_custom_framework(zip_path: Path, framework_name: str) -> Tuple[bool, dict, str]:
+    """
+    导入用户自定义实盘框架 zip 包。
+
+    编排流程: 校验框架名 → 查 DB 冲突 → 解压到临时目录 → 识别布局 →
+              安全门禁 → (覆盖时) 清理旧框架 → 落地到 firm/ → 写 DB → 返回结果
+
+    :param zip_path: 临时保存的 zip 文件路径（由 main.py 端点落盘）
+    :param framework_name: 前端传入的框架名称（含 usr_ 前缀），用于正则校验和 framework_id 派生。
+                           zip 文件名不参与 ID 派生——名称完全由前端决定。
+    :return: (success, response_data, error_msg)
+             - 成功时 response_data 含 framework_id/path/entry_scripts 等字段
+             - 失败时 response_data 为 {}，error_msg 为用户可读消息
+
+    异常契约: 不抛出，所有 ValueError / Exception 都在内部被捕获并翻译为返回值。
+    """
+    extract_dir: Optional[Path] = None
+    target_path: Optional[Path] = None
+    overwrite_in_progress = False
+
+    try:
+        _validate_framework_name(framework_name)
+        framework_id = _derive_framework_id(framework_name)
+
+        overwrite, existing = _resolve_overwrite_target(framework_id)
+
+        # 解压到临时目录（先 mkdir，让 resolve() 稳定）
+        extract_dir = TMP_PATH / f'import_custom_{uuid4().hex}_extract'
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        _extract_zip_with_gbk_fallback(zip_path, extract_dir)
+
+        framework_root = _resolve_framework_root(extract_dir)
+        entry_scripts = _validate_framework_structure(framework_root)
+
+        if overwrite:
+            _cleanup_existing_framework(
+                framework_id, existing.path if existing else None
+            )
+            overwrite_in_progress = True
+
+        target_path = _install_imported_framework(
+            framework_root, framework_id, entry_scripts
+        )
+
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # save_framework_status 返回 bool（False 表示内部异常被吞掉）。
+        # 必须检查并显式抛错，否则在覆盖场景下：旧 DB 记录已删 + 新 DB 记录写入失败
+        # = 系统无该 framework 记录但磁盘上有 target，孤儿状态。
+        save_ok = save_framework_status(
+            framework_id, framework_name, StatusEnum.FINISHED,
+            POSITION_TYPE, now_str,
+            source=FrameworkSourceEnum.IMPORTED.value,
+            path=str(target_path),
+        )
+        if not save_ok:
+            raise RuntimeError("写入框架状态记录失败，请检查数据库")
+
+        data = {
+            'framework_id': framework_id,
+            'framework_name': framework_name,
+            'path': str(target_path),
+            'type': POSITION_TYPE,
+            'source': FrameworkSourceEnum.IMPORTED.value,
+            'entry_scripts': entry_scripts,
+            'time': now_str,
+        }
+        return True, data, ''
+
+    except ValueError as ve:
+        _safe_cleanup(target_path)
+        return False, {}, str(ve)
+    except Exception as e:
+        logger.exception(f'导入自定义框架失败: {zip_path}')
+        _safe_cleanup(target_path)
+        msg = f'导入失败: {e}'
+        if overwrite_in_progress:
+            msg += '；旧框架已被删除，请重新上传'
+        return False, {}, msg
+    finally:
+        if extract_dir and extract_dir.exists():
+            shutil.rmtree(extract_dir, ignore_errors=True)
