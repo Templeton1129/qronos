@@ -71,7 +71,7 @@ from service.basic_code import (
     generate_account_py_file_from_config, extract_variables_from_py,
     generate_account_py_file_from_json, process_framework_account_statistics,
     migrate_framework_data, export_framework_data, import_framework_data, detect_config_file_type,
-    extract_variables_from_coin_config, import_custom_framework
+    extract_variables_from_coin_config, import_custom_framework, _normalize_is_simulate,
 )
 from service.showcase_statistics import process_account_showcase_statistics
 from service.command import (
@@ -734,12 +734,7 @@ def basic_code_query_config(framework_id: str):
         config_json_path = Path(framework_status.path) / 'config.json'
         if config_json_path.exists():
             config_json = json.loads(config_json_path.read_text(encoding='utf-8'))
-            # 针对一些脏数据的 is_simulate 为 null，改成 none
-            if 'is_simulate' in config_json:
-                if config_json.get('is_simulate') is None:
-                    config_json['is_simulate'] = 'none'
-            else:
-                config_json['is_simulate'] = 'debug'
+            config_json['is_simulate'] = _normalize_is_simulate(config_json)
             return ResponseModel.ok(data=config_json)
 
         return ResponseModel.ok()

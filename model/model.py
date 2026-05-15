@@ -125,6 +125,7 @@ class FrameworkCfgModel(BaseModel):
     is_simulate: Optional[str] = 'none'
     lookback_days: int = 0
     incremental_lookback_hours: int = 0
+    lookback_save_interval_hours: int = 0
 
 
 class DeviceInfo(BaseModel):

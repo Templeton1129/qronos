@@ -47,13 +47,14 @@ _statistics_cache: Dict[tuple, dict] = {}
 _CACHE_TTL = 300  # 缓存过期时间（秒）
 
 
-def _collect_file_mtimes(account_json_path: Path, account_info_path: Path) -> dict:
+def _collect_file_mtimes(account_json_path: Path, account_info_path: Path, config_json_path: Path) -> dict:
     """
     收集账户统计依赖文件的修改时间。
 
     Args:
         account_json_path: 账户配置文件路径。
         account_info_path: 账户统计目录路径。
+        config_json_path: 框架全局配置路径；is_simulate 变更时需要失效缓存。
 
     Returns:
         dict: 文件路径与修改时间的映射，用于缓存失效判断。
@@ -61,6 +62,7 @@ def _collect_file_mtimes(account_json_path: Path, account_info_path: Path) -> di
     mtimes = {}
     for file_path in [
         account_json_path,
+        config_json_path,
         account_info_path / 'equity.pkl',
         account_info_path / 'sub_stg_eqs.pkl',
         account_info_path / 'pos_spot.pkl',
@@ -70,6 +72,24 @@ def _collect_file_mtimes(account_json_path: Path, account_info_path: Path) -> di
         if file_path.exists():
             mtimes[str(file_path)] = os.path.getmtime(file_path)
     return mtimes
+
+
+def _normalize_is_simulate(config_json: Optional[dict]) -> str:
+    """
+    规范化框架 config.json 的 is_simulate 字段。
+
+    Args:
+        config_json: 框架全局配置；None 或字段缺失表示旧配置。
+
+    Returns:
+        str: 'debug'（缺失/None）、'none'（显式 null，正式实盘）或配置中的原值。
+    """
+    if config_json is None or 'is_simulate' not in config_json:
+        return 'debug'
+    value = config_json.get('is_simulate')
+    if value is None:
+        return 'none'
+    return value
 
 
 def _is_cache_valid(cache_entry: dict, current_mtimes: dict) -> bool:
@@ -122,13 +142,24 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
         logger.warning(f"数据目录不存在: {data_path}")
         return result
 
+    # ===== 读取框架全局配置，解析运行模式 =====
+    # 框架级配置所有账户共享，循环外读一次即可；文件缺失/解析失败兜底 'debug'。
+    config_json_path = Path(framework_status.path) / 'config.json'
+    framework_config: Optional[dict] = None
+    if config_json_path.exists():
+        try:
+            framework_config = json.loads(config_json_path.read_text(encoding='utf-8'))
+        except Exception as e:
+            logger.warning(f"读取框架 config.json 失败，is_simulate 将回退到默认值: {e}")
+    is_simulate = _normalize_is_simulate(framework_config)
+
     # 获取所有有效的账户配置文件
     account_list = [
         file.stem
         for file in account_path.iterdir()
         if file.is_file() and file.suffix == ".json" and not file.name.startswith('_')
     ]
-    
+
     logger.info(f"框架 {framework_status.framework_name} 中找到 {len(account_list)} 个账户")
 
     for account_name in account_list:
@@ -144,7 +175,7 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
 
             # ===== 缓存检查 =====
             cache_key = (framework_status.framework_id, account_name, query_days)
-            current_mtimes = _collect_file_mtimes(account_json_path, account_info_path)
+            current_mtimes = _collect_file_mtimes(account_json_path, account_info_path, config_json_path)
             cached = _statistics_cache.get(cache_key)
             if cached and _is_cache_valid(cached, current_mtimes):
                 result.append(cached['data'])
@@ -163,6 +194,7 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
                 'strategy_name': account_json['strategy_name'],
                 'strategy_config': account_json['strategy_config'],
                 'strategy_pool': account_json['strategy_pool'],
+                'is_simulate': is_simulate,
             }
 
             # 处理资金曲线数据
@@ -463,7 +495,9 @@ def generate_account_py_file_from_json(account_name: str, account_json: dict, ac
         existing_data = read_existing_py_file(target_py_path)
 
     # 策略相关字段：优先使用现有文件中的内容（由 config 上传产生）
-    strategy_fields = ['strategy_name', 'strategy_config', 'strategy_pool', 'rebalance_mode']
+    # 注意：rebalance_mode 不在此列表中——它允许通过 account 接口直接更新；
+    # 上传策略文件路径走 update_mode=False，不依赖此列表的保护。
+    strategy_fields = ['strategy_name', 'strategy_config', 'strategy_pool']
 
     # AccountModel 相关字段：允许更新
     account_fields = ['account_config', 'get_kline_num', 'leverage', 'black_list', 'white_list', 'min_kline_num']
@@ -1710,17 +1744,17 @@ def import_framework_data(zip_file_path: Path, target_framework_status) -> Tuple
                 for item in data_source.iterdir():
                     if item.is_dir():
                         target_item = data_target / item.name
-                        
+
                         try:
-                            if target_item.exists():
-                                shutil.rmtree(target_item)
-                            # 导入时也要排除__pycache__目录（保持一致性）
+                            # merge 而非整目录替换：导出包按 include_only_dirs 过滤掉了部分子目录
+                            # （如 持仓信息）；rmtree 会误删 zip 不包含但本就存在于目标的数据。
+                            # copy_directory_with_filter 是 per-file 覆盖语义，zip 没有的会保留。
                             copied_files = copy_directory_with_filter(
-                                item, 
+                                item,
                                 target_item,
                                 exclude_dirs=["__pycache__"]
                             )
-                            logger.debug(f"已导入数据目录: {item.name} (文件数: {copied_files})")
+                            logger.debug(f"已合并数据目录: {item.name} (文件数: {copied_files})")
                         except Exception as e:
                             error_msg = f"导入数据目录失败 {item.name}: {e}"
                             errors.append(error_msg)
